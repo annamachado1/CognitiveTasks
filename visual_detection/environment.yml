@@ -1,4 +1,4 @@
-name: NovelStimuli
+name: WM
 channels:
   - conda-forge
   - defaults
