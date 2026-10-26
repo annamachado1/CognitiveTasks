@@ -29,6 +29,9 @@ try:
         # --- Response ---
         response_key="space",
         response_window=1.5,          # seconds after target onset that count as a hit
+        # A press this many seconds after the hit window closes is logged as a
+        # late response to that target, not a false alarm. 0 turns this off.
+        late_response_window=1.0,
 
         # --- Sequence ---
         target_lag=1,                 # 1 = same as previous symbol, 2 = same as two back
@@ -65,19 +68,18 @@ try:
         "datetime", "run_id", "subject", "practice", "seed", "phase",
         "event_num", "event_type",
         "presentation_num", "onset_s", "symbol", "nback_symbol",
-        "key_name", "press_time_s", "rt_ms", "responded",
+        "key_name", "press_time_s", "rt_ms", "responded", "late_response",
         "attributed_to_presentation", "presentations_after_target",
-        "feedback_tone",
     ]
 
     BLOCK_FIELDS = [
         "datetime", "run_id", "subject", "practice", "seed", "phase",
         "stream_duration_s", "n_presentations", "n_frames",
-        "n_targets", "n_hits", "n_misses",
+        "n_targets", "n_hits", "n_misses", "n_late_responses",
         "n_false_alarms", "n_duplicate_presses", "n_other_keys",
-        "hit_rate", "mean_rt_ms", "median_rt_ms",
+        "hit_rate", "mean_rt_ms", "median_rt_ms", "mean_late_rt_ms",
         "hit_rate_h1", "hit_rate_h2", "mean_rt_h1_ms", "mean_rt_h2_ms",
-        "fa_per_min", "time_at_risk_s", "audio_feedback",
+        "fa_per_min", "time_at_risk_s",
         "frmrate_measured", "n_dropped_frames", "completed",
     ]
 
@@ -124,6 +126,8 @@ try:
             problems.append("symbol_dur and blank_dur must both be positive")
         if p["response_window"] <= 0:
             problems.append("response_window must be positive")
+        if p["late_response_window"] < 0:
+            problems.append("late_response_window cannot be negative")
         if int(p["target_lag"]) < 1:
             problems.append("target_lag must be 1 or more")
         n_sym = len(set(p["symbols"]))
@@ -147,6 +151,7 @@ try:
             min_repeat_gap=int(p["min_repeat_gap"]),
             symbols_per_min=60.0 / soa,
             response_window=w,
+            late_response_window=p["late_response_window"],
             window_past_next_symbol=w - soa,
             min_target_spacing=min_gap_presentations(p) * soa,
             n_presentations=int(p["stream_duration"] // soa),
@@ -164,6 +169,10 @@ try:
         print(f"  no other symbol repeats within {no_repeat_window(p)} symbols")
         print(f"  response window {s['response_window']:.2f}s; targets at "
               f"least {s['min_target_spacing']:.2f}s apart")
+        if s["late_response_window"] > 0:
+            print(f"  presses {s['response_window']:.2f}-"
+                  f"{s['response_window'] + s['late_response_window']:.2f}s "
+                  f"after a target are logged as late responses")
         if s["window_past_next_symbol"] > 0:
             print(f"  NOTE: the window runs {s['window_past_next_symbol']:.2f}s "
                   f"past the next symbol's onset, so a late response can overlap "
@@ -199,6 +208,10 @@ try:
         min_gap = min_gap_presentations(p)
         no_repeat = no_repeat_window(p)
         first_ok = max(lag, int(np.ceil(p["first_event_min_s"] / soa)))
+        # The last target must leave its full hit and late windows before the
+        # stream ends, or a timely press could never be recorded.
+        last_ok = int(np.floor(
+            n_pres - (p["response_window"] + p["late_response_window"]) / soa))
 
         if p["target_rate_mode"] == "per_presentation":
             n_targets = int(round(p["targets_per_min"] / 60.0 * n_pres))
@@ -206,7 +219,7 @@ try:
             stream_min = (n_pres * soa) / 60.0
             n_targets = int(round(p["targets_per_min"] * stream_min))
 
-        span = n_pres - first_ok
+        span = last_ok + 1 - first_ok
         if n_targets > 0 and span // min_gap < n_targets:
             n_targets = max(0, int(span // min_gap) - 1)
 
@@ -218,7 +231,7 @@ try:
 
         slots = set()
         i = first_ok + int(rng.integers(0, min_gap + 1))
-        while i < n_pres and len(slots) < n_targets:
+        while i <= last_ok and len(slots) < n_targets:
             slots.add(int(i))
             i += min_gap + int(rng.geometric(p_geom)) - 1
 
@@ -251,6 +264,7 @@ try:
                 repeat_lag=repeat_lag[i],
                 responded=False,
                 rt=None,
+                late_rt=None,
             ))
         return stream
 
@@ -269,6 +283,11 @@ try:
         if targets and targets[0] * soa < p["first_event_min_s"]:
             problems.append(f"first target at {targets[0] * soa:.1f}s, "
                             f"before {p['first_event_min_s']}s")
+        end = len(stream) * soa
+        if targets and (targets[-1] * soa + p["response_window"]
+                        + p["late_response_window"] > end + 1e-9):
+            problems.append(f"last target at {targets[-1] * soa:.1f}s cannot be "
+                            f"fully answered before the stream ends at {end:.1f}s")
 
         for s in stream:
             if s["is_target"]:
@@ -300,21 +319,29 @@ try:
                 float(info["Screen width (cm)"]), float(info["Viewing distance (cm)"]))
 
 
+    def open_csv(path, header):
+        # A file written with different columns is renamed, not appended to.
+        if os.path.exists(path):
+            with open(path, newline="") as f:
+                existing = next(csv.reader(f), None)
+            if existing != header:
+                root, ext = os.path.splitext(path)
+                old = f"{root}_old-{datetime.now():%Y%m%d-%H%M%S}{ext}"
+                os.rename(path, old)
+                print(f"[columns have changed: moved {path} to {old}]")
+        new = not os.path.exists(path)
+        fh = open(path, "a", newline="")
+        writer = csv.writer(fh)
+        if new:
+            writer.writerow(header)
+        return fh, writer
+
+
     def make_writers(subj):
-        ev_name = data_path(subj, f"s{subj}_events.csv")
-        ev_new = not os.path.exists(ev_name)
-        ev_file = open(ev_name, "a", newline="")
-        ev_writer = csv.writer(ev_file)
-        if ev_new:
-            ev_writer.writerow(EVENT_FIELDS)
-
-        bk_name = data_path(subj, f"s{subj}_blocks.csv")
-        bk_new = not os.path.exists(bk_name)
-        bk_file = open(bk_name, "a", newline="")
-        bk_writer = csv.writer(bk_file)
-        if bk_new:
-            bk_writer.writerow(BLOCK_FIELDS)
-
+        ev_file, ev_writer = open_csv(data_path(subj, f"s{subj}_events.csv"),
+                                      EVENT_FIELDS)
+        bk_file, bk_writer = open_csv(data_path(subj, f"s{subj}_blocks.csv"),
+                                      BLOCK_FIELDS)
         return ev_file, ev_writer, bk_file, bk_writer
 
 
@@ -358,71 +385,6 @@ try:
             json.dump(payload, f, indent=2, default=str)
 
 
-    class Feedback:
-        """Feedback tones. Every call is a silent no-op if audio is unavailable."""
-
-        def __init__(self, p):
-            self.cfg = p["audio_feedback"]
-            self.tones = {}
-            self.ok = False
-            if not self.cfg.get("enabled"):
-                return
-            try:
-                from psychopy import sound
-                specs = (("hit", self.cfg["hit_hz"], self.cfg["hit_secs"]),
-                         ("false_alarm", self.cfg["false_alarm_hz"],
-                          self.cfg["false_alarm_secs"]),
-                         ("miss", self.cfg["miss_hz"], self.cfg["miss_secs"]))
-                for name, hz, secs in specs:
-                    try:
-                        s = sound.Sound(value=hz, secs=secs, hamming=True,
-                                        volume=self.cfg["volume"], name=name)
-                    except TypeError:
-                        s = sound.Sound(value=hz, secs=secs,
-                                        volume=self.cfg["volume"])
-                    self.tones[name] = s
-                self.ok = True
-            except Exception as e:
-                print(f"[auditory feedback unavailable: {e}] — running silently")
-                return
-
-            # Warm up the backend so the first real tone does not drop a frame.
-            try:
-                for s in self.tones.values():
-                    s.volume = 0.0
-                    s.play()
-                    s.stop()
-                    s.volume = self.cfg["volume"]
-            except Exception:
-                pass
-
-        def wanted(self, kind, phase):
-            c = self.cfg
-            if not (self.ok and c.get("enabled")):
-                return False
-            if phase == "practice" and not c.get("in_practice"):
-                return False
-            if phase == "test" and not c.get("in_test"):
-                return False
-            return bool(c.get(f"on_{kind}"))
-
-        def play(self, kind, phase):
-            if not self.wanted(kind, phase):
-                return ""
-            s = self.tones.get(kind)
-            if s is None:
-                return ""
-            try:
-                s.stop()
-            except Exception:
-                pass
-            try:
-                s.play()
-                return kind
-            except Exception:
-                return ""
-
-
     def build_stimuli(win, p):
         sym = visual.TextStim(win, text="", height=p["symbol_height"],
                               font=p["symbol_font"],
@@ -443,12 +405,13 @@ try:
     # ------------------------------------------------------------------ #
 
     def run_stream(win, kb, stim, p, stream, duration, phase, log_event,
-                   feedback=None, out=None):
+                   out=None):
         sym_stim, dot_stim, mask_stim, text = stim
         soa, sdur = soa_of(p), p["symbol_dur"]
         window = p["response_window"]
+        late_win = p["late_response_window"]
         n_pres = len(stream)
-        lookback = int(np.ceil(window / soa)) + 1
+        lookback = int(np.ceil((window + late_win) / soa)) + 1
 
         events_log = []
         event_counter = [0]
@@ -469,19 +432,18 @@ try:
             ev["nback_symbol"] = s["nback_symbol"]
             return ev
 
-        n_hits = n_fa = n_dup = n_other = 0
+        n_hits = n_fa = n_dup = n_other = n_late = 0
         n_frames = 0
         rts = []
-
-        if feedback is None:
-            feedback = Feedback(dict(audio_feedback=dict(enabled=False)))
-        target_idxs = [s["idx"] for s in stream if s["is_target"]]
-        miss_ptr = 0
-        miss_toned = set()
+        late_rts = []
 
         kb.clearEvents()
         win.frameIntervals = []
-        clock = core.Clock()
+        # Symbol onsets and key presses are both timed on the keyboard's clock,
+        # so a press's rt is directly comparable with the stream schedule.
+        clock = kb.clock
+        clock.reset()
+        seen_presses = set()
         completed = False
         last_drawn = None
         loaded_symbol = None
@@ -514,6 +476,13 @@ try:
 
                 keys = kb.getKeys(waitRelease=False)
                 for k in keys:
+                    # Count each physical press once, even if the keyboard
+                    # reports it on more than one frame.
+                    press_id = (k.name, getattr(k, "tDown", None))
+                    if press_id[1] is not None:
+                        if press_id in seen_presses:
+                            continue
+                        seen_presses.add(press_id)
                     if k.name == "escape":
                         raise AbortExperiment()
                     if k.name != p["response_key"]:
@@ -524,42 +493,62 @@ try:
                         emit(ev)
                         continue
 
-                    # Keyboard timestamps share the core clock; convert to
-                    # stream time.
+                    # rt is the press time on the keyboard clock, i.e. stream
+                    # time. Fall back to the current time if it is unusable.
                     t_now = clock.getTime()
-                    tk = getattr(k, "tDown", None)
-                    if tk is not None and np.isfinite(tk):
-                        t_press = t_now - (core.getTime() - tk)
-                        if not (0.0 <= t_press <= t_now + 0.001):
-                            t_press = t_now
-                    else:
+                    t_press = getattr(k, "rt", None)
+                    if t_press is not None and np.isfinite(t_press) and t_press < 0:
+                        continue      # began before the stream, e.g. the start key
+                    if (t_press is None or not np.isfinite(t_press)
+                            or t_press > t_now + 0.001):
                         t_press = t_now
 
-                    # Attribute the press to the most recent target whose
-                    # response window is still open.
+                    # A press within a target's response window is a hit. If no
+                    # window is open, a press shortly after one closed belongs
+                    # to that target as a late response. Only presses with
+                    # neither are false alarms.
                     j = int(t_press // soa)
-                    hit_on = None
+                    hit_on = late_on = None
                     for cand in range(j, max(-1, j - lookback - 1), -1):
                         if cand < 0 or cand >= n_pres:
                             continue
                         s = stream[cand]
-                        if s["is_target"] and 0 <= t_press - s["onset"] <= window:
+                        if not s["is_target"]:
+                            continue
+                        dt = t_press - s["onset"]
+                        if 0 <= dt <= window:
                             hit_on = s
                             break
+                        if late_on is None and window < dt <= window + late_win:
+                            late_on = s
+                    owner = hit_on or late_on
 
-                    if hit_on is None:
+                    if owner is None:
                         n_fa += 1
                         ev = blank_event("False Alarm")
                         ev["key_name"] = p["response_key"]
                         ev["press_time_s"] = f"{t_press:.4f}"
-                        ev["feedback_tone"] = feedback.play("false_alarm", phase)
                         emit(ev)
-                    elif hit_on["responded"]:
+                    elif owner["responded"] or owner["late_rt"] is not None:
                         n_dup += 1
                         ev = blank_event("Duplicate Press")
                         ev["key_name"] = p["response_key"]
                         ev["press_time_s"] = f"{t_press:.4f}"
-                        ev["attributed_to_presentation"] = hit_on["idx"]
+                        ev["attributed_to_presentation"] = owner["idx"]
+                        emit(ev)
+                    elif hit_on is None:
+                        rt = (t_press - late_on["onset"]) * 1000.0
+                        late_on["late_rt"] = rt
+                        late_rts.append(rt)
+                        n_late += 1
+                        ev = presentation_row(late_on, "Late Response")
+                        ev["key_name"] = p["response_key"]
+                        ev["press_time_s"] = f"{t_press:.4f}"
+                        ev["rt_ms"] = f"{rt:.1f}"
+                        ev["late_response"] = 1
+                        ev["attributed_to_presentation"] = late_on["idx"]
+                        ev["presentations_after_target"] = int(
+                            (t_press - late_on["onset"]) // soa)
                         emit(ev)
                     else:
                         hit_on["responded"] = True
@@ -575,18 +564,7 @@ try:
                         ev["attributed_to_presentation"] = hit_on["idx"]
                         ev["presentations_after_target"] = int(
                             (t_press - hit_on["onset"]) // soa)
-                        ev["feedback_tone"] = feedback.play("hit", phase)
                         emit(ev)
-
-                if feedback.wanted("miss", phase):
-                    while miss_ptr < len(target_idxs):
-                        s = stream[target_idxs[miss_ptr]]
-                        if t < s["onset"] + window:
-                            break
-                        if not s["responded"] and s["idx"] not in miss_toned:
-                            feedback.play("miss", phase)
-                            miss_toned.add(s["idx"])
-                        miss_ptr += 1
 
                 last_drawn = i
 
@@ -606,8 +584,20 @@ try:
                     n_misses += 1
                     ev = presentation_row(s, "Miss")
                     ev["responded"] = 0
-                    ev["feedback_tone"] = "miss" if s["idx"] in miss_toned else ""
+                    ev["late_response"] = int(s["late_rt"] is not None)
                     emit(ev)
+
+            # Time in which a press would have counted as a false alarm: the
+            # run minus every target's hit and late windows (merged where
+            # they overlap).
+            covered, reach = 0.0, 0.0
+            for s in stream[:shown]:
+                if s["is_target"]:
+                    a = max(s["onset"], reach)
+                    b = min(s["onset"] + window + late_win, elapsed)
+                    if b > a:
+                        covered += b - a
+                    reach = max(reach, b)
 
             ev = blank_event("Stream End" if completed else "Stream Aborted")
             ev["press_time_s"] = f"{elapsed:.4f}"
@@ -634,16 +624,14 @@ try:
                 mean_rt_h1=(float(np.mean(rt_h1)) if rt_h1 else ""),
                 mean_rt_h2=(float(np.mean(rt_h2)) if rt_h2 else ""),
                 n_frames=n_frames, n_targets=n_targets, n_hits=n_hits,
-                n_misses=n_misses, n_fa=n_fa, n_dup=n_dup, n_other=n_other,
+                n_misses=n_misses, n_late=n_late,
+                n_fa=n_fa, n_dup=n_dup, n_other=n_other,
                 hit_rate=(n_hits / n_targets) if n_targets else "",
                 mean_rt=(float(np.mean(rts)) if rts else ""),
                 median_rt=(float(np.median(rts)) if rts else ""),
-                time_at_risk=max(0.0, elapsed - n_targets * p["response_window"]),
+                mean_late_rt=(float(np.mean(late_rts)) if late_rts else ""),
+                time_at_risk=max(0.0, elapsed - covered),
                 n_dropped=n_dropped, completed=completed, events=events_log,
-                audio_feedback=int(bool(
-                    feedback.ok and (feedback.wanted("hit", phase)
-                                     or feedback.wanted("false_alarm", phase)
-                                     or feedback.wanted("miss", phase)))),
             )
             if out is not None:
                 out.update(summary)
@@ -704,10 +692,6 @@ try:
 
         stim = build_stimuli(win, P)
         text = stim[3]
-        feedback = Feedback(P)
-        if P["audio_feedback"]["enabled"] and not feedback.ok:
-            print("[audio feedback requested but unavailable — "
-                  "the run will continue without it]")
         ev_file, ev_writer, bk_file, bk_writer = make_writers(subj)
 
         instr = (
@@ -770,7 +754,7 @@ try:
                 result = {}
                 try:
                     run_stream(win, kb, stim, P, stream, duration, phase,
-                               log_event, feedback=feedback, out=result)
+                               log_event, out=result)
                 finally:
                     if result:
                         bk_writer.writerow([
@@ -778,7 +762,7 @@ try:
                             run_id, subj, int(phase == "practice"), seed, phase,
                             f'{result["elapsed"]:.3f}', result["n_presentations"],
                             result["n_frames"], result["n_targets"],
-                            result["n_hits"], result["n_misses"],
+                            result["n_hits"], result["n_misses"], result["n_late"],
                             result["n_fa"], result["n_dup"], result["n_other"],
                             (f'{result["hit_rate"]:.4f}'
                              if result["hit_rate"] != "" else ""),
@@ -786,6 +770,8 @@ try:
                              if result["mean_rt"] != "" else ""),
                             (f'{result["median_rt"]:.1f}'
                              if result["median_rt"] != "" else ""),
+                            (f'{result["mean_late_rt"]:.1f}'
+                             if result["mean_late_rt"] != "" else ""),
                             (f'{result["hit_rate_h1"]:.4f}'
                              if result["hit_rate_h1"] != "" else ""),
                             (f'{result["hit_rate_h2"]:.4f}'
@@ -797,7 +783,6 @@ try:
                             (f'{result["n_fa"] / (result["elapsed"] / 60.0):.2f}'
                              if result["elapsed"] > 0 else ""),
                             f'{result["time_at_risk"]:.3f}',
-                            result["audio_feedback"],
                             f'{P["frmrate_measured"]:.3f}',
                             result["n_dropped"], int(result["completed"]),
                         ])
@@ -817,7 +802,8 @@ try:
                               "Practice complete.\n\n"
                               f"Repeats detected: {result['n_hits']} "
                               f"of {result['n_targets']}\n"
-                              f"Missed: {result['n_misses']}\n"
+                              f"Missed: {result['n_misses'] - result['n_late']}\n"
+                              f"Pressed too late: {result['n_late']}\n"
                               f"Presses with no repeat: {result['n_fa']}\n\n"
                               + tail + "\n\nPress any key to continue.")
                     if not retry:
