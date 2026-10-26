@@ -15,97 +15,42 @@ try:
     from datetime import datetime
 
     P = dict(
-        # --- Stream timing -------------------------------------------------
-        # One symbol at a time, alternating between two positions.
-        #
-        # blank_dur is the experimental knob: lengthening it lengthens the
-        # interval over which a symbol must be held in memory, since the
-        # same-position (retention) interval is 2 x (symbol_dur + blank_dur).
-        # symbol_dur is meant to stay fixed while blank_dur is varied.
-        #
-        # Defaults reproduce the original schematic: symbols every 1.0 s, each
-        # position every 2.0 s, each location empty for 1.5 s between its own
-        # symbols. Everything downstream is derived, so changing blank_dur
-        # alone rescales the whole schedule consistently.
-        symbol_dur=0.5,             # display duration — held fixed
-        blank_dur=0.5,              # blank between successive symbols — varied
-        stream_duration=300.0,      # 5 minutes of test stream
+        # --- Timing ---
+        # Memory interval = target_lag x (symbol_dur + blank_dur).
+        # blank_dur is the manipulated variable; symbol_dur stays fixed.
+        symbol_dur=0.5,
+        blank_dur=0.5,
+        stream_duration=300.0,
         practice_duration=45.0,
         run_practice=True,
-        # Practice may be repeated if the participant clearly has not grasped
-        # the rule. Set practice_max_runs=1 to disable the retry.
-        practice_max_runs=2,
+        practice_max_runs=2,          # 1 disables the practice retry
         practice_pass_hit_rate=0.5,
 
-        # --- Response ------------------------------------------------------
+        # --- Response ---
         response_key="space",
-        # A press counts as a hit if it lands within this many seconds of a
-        # target onset. Kept below the 2.0 s gap between successive symbols at
-        # one position, so a press can never be ambiguous between two items.
-        response_window=1.5,
+        response_window=1.5,          # seconds after target onset that count as a hit
 
-        # --- Sequence structure --------------------------------------------
-        # Target: the symbol matches the previous symbol AT THE SAME POSITION
-        #         (two presentations back). This is the event to respond to.
-        # Lure:   the symbol matches the immediately preceding symbol at the
-        #         OTHER position. Not a target; it exists so that "have I seen
-        #         this symbol recently?" is not a sufficient strategy.
+        # --- Sequence ---
+        target_lag=1,                 # 1 = same as previous symbol, 2 = same as two back
         targets_per_min=10.0,
-        lures_per_min=10.0,
-        # "per_minute" holds the rate per unit time, so a longer blank_dur means
-        # fewer presentations but the same number of targets — and therefore a
-        # higher chance of a target per symbol. "per_presentation" holds that
-        # per-symbol chance fixed instead, so target count falls with blank_dur.
-        # The two diverge as soon as blank_dur is varied; see README.
+        # "per_minute": fixed targets per minute; "per_presentation": fixed
+        # chance per symbol. The two diverge when blank_dur changes.
         target_rate_mode="per_minute",
-        # Floor on the interval between any two repeat events, in seconds.
-        # Converted to presentations at run time, so it holds whatever the
-        # timing is set to.
+        min_repeat_gap=10,            # non-targets never repeat within this many symbols
         min_event_gap_s=2.0,
         first_event_min_s=6.0,
-        # A same-position repeat at lag 2-3 is recent enough to be a plausible
-        # memory intrusion, and is flagged so those false alarms can be told
-        # apart from random ones. Beyond that the whole pool has been seen at
-        # every location, so a longer lag carries no information.
-        dist_repeat_max_lag=3,
-        # Excludes visually confusable characters (B G I L O Q S Z 0 1 2 5 6 8)
-        # so perceptual errors are not mistaken for memory errors.
+        # Visually confusable characters (B G I L O Q S Z 0 1 2 5 6 8) excluded.
         symbols="ACDEFHJKMNPRTUVWXY3479",
 
-        # --- Auditory feedback ---------------------------------------------
-        # Short tones fired the moment a response is classified. The whole
-        # feature is off by default: set enabled=True to switch it on, and the
-        # per-phase and per-event flags below decide where it applies. If no
-        # sound backend is available the task prints a warning and runs
-        # silently rather than failing.
-        audio_feedback=dict(
-            enabled=False,          # master switch — the only one you need to flip
-            in_practice=True,       # where it applies, once enabled
-            in_test=False,
-            on_hit=True,
-            on_false_alarm=True,
-            on_miss=False,          # fires when a target's window closes unanswered
-            hit_hz=1000.0, hit_secs=0.06,
-            false_alarm_hz=350.0, false_alarm_secs=0.12,
-            miss_hz=220.0, miss_secs=0.12,
-            volume=0.5,
-        ),
-
-        # --- Display -------------------------------------------------------
-        position_offset=220,        # pixels left and right of centre
+        # --- Display ---
         symbol_height=64,
         symbol_font="Arial",
         symbol_col=(0, 0, 0),
         bkgd_col=(160, 160, 160),
-        # Small marker showing the currently empty location, as in the design
-        # schematic. Both locations are always marked.
-        show_placeholder=True,
+        show_placeholder=True,        # fixation dot during blanks
         placeholder_radius=5,
         placeholder_col=(90, 90, 90),
-        # Optional low-contrast mask filling the empty location through its
-        # blank interval. Off by default; switch on if piloting shows
-        # afterimages of the symbols.
-        use_mask=False,
+        use_mask=False,               # low-contrast mask during blanks
         mask_radius=42,
         mask_col=(140, 140, 140),
 
@@ -114,44 +59,31 @@ try:
     )
 
     DATA_DIR = "data"
+    FILE_PREFIX = "VWMcentre"
 
     EVENT_FIELDS = [
         "datetime", "run_id", "subject", "practice", "seed", "phase",
         "event_num", "event_type",
-        "presentation_num", "onset_s", "position", "symbol",
-        "prev_same_pos_symbol", "prev_other_pos_symbol",
+        "presentation_num", "onset_s", "symbol", "nback_symbol",
         "key_name", "press_time_s", "rt_ms", "responded",
-        "attributed_to_presentation",
-        # same_pos_lag: how many symbols back AT THIS POSITION this symbol last
-        # appeared. 1 = target. >=2 = a repeat at this location that is not a
-        # target under the confirmed rule, and so a natural source of intrusions.
-        "same_pos_lag",
-        # How many further symbols had appeared between the target's onset and
-        # the press. 0 = answered before the next symbol arrived.
-        "presentations_after_target",
-        "near_lure", "near_dist_repeat", "feedback_tone",
+        "attributed_to_presentation", "presentations_after_target",
+        "feedback_tone",
     ]
 
     BLOCK_FIELDS = [
         "datetime", "run_id", "subject", "practice", "seed", "phase",
         "stream_duration_s", "n_presentations", "n_frames",
         "n_targets", "n_hits", "n_misses",
-        "n_lures", "n_lure_false_alarms",
         "n_false_alarms", "n_duplicate_presses", "n_other_keys",
         "hit_rate", "mean_rt_ms", "median_rt_ms",
-        # Split-half, so a decline across the run is visible without any
-        # separate analysis.
         "hit_rate_h1", "hit_rate_h2", "mean_rt_h1_ms", "mean_rt_h2_ms",
-        "n_dist_repeats", "n_dist_repeat_false_alarms",
         "fa_per_min", "time_at_risk_s", "audio_feedback",
         "frmrate_measured", "n_dropped_frames", "completed",
     ]
 
-    LEFT, RIGHT = 0, 1
-
 
     class AbortExperiment(Exception):
-        """Raised on escape so data buffers flush instead of hard-quitting."""
+        """Raised on escape so data is saved before quitting."""
         pass
 
 
@@ -166,63 +98,57 @@ try:
 
 
     def soa_of(p):
-        """Onset-to-onset interval between successive symbols."""
         return p["symbol_dur"] + p["blank_dur"]
 
 
     def retention_interval(p):
-        """Gap between successive symbols at one position — the memory interval."""
-        return 2.0 * soa_of(p)
+        return int(p["target_lag"]) * soa_of(p)
+
+
+    def no_repeat_window(p):
+        # Never less than target_lag, so fillers cannot create accidental targets.
+        return max(int(p["min_repeat_gap"]), int(p["target_lag"]))
 
 
     def min_gap_presentations(p):
-        """Minimum presentations between repeat events, given the current timing.
-
-        Enforces three things at once: the requested floor in seconds, a gap
-        wide enough that response windows never overlap, and a floor of 2 so no
-        two events are adjacent (which is what guarantees a target can never
-        also be a lure).
-        """
+        # Also guarantees that response windows of successive targets never overlap.
         soa = soa_of(p)
-        return max(2,
+        return max(int(p["target_lag"]) + 1,
                    int(np.ceil(p["min_event_gap_s"] / soa)),
                    int(np.ceil(p["response_window"] / soa)))
 
 
-    def check_timing(p):
-        """Reject timing combinations that would make scoring ambiguous."""
+    def check_params(p):
         problems = []
-        if p["response_window"] >= retention_interval(p):
-            problems.append(
-                f'response_window ({p["response_window"]}s) must be shorter than '
-                f'the same-position interval ({retention_interval(p):.2f}s), or a '
-                f'press cannot be attributed to one symbol')
         if p["blank_dur"] <= 0 or p["symbol_dur"] <= 0:
             problems.append("symbol_dur and blank_dur must both be positive")
+        if p["response_window"] <= 0:
+            problems.append("response_window must be positive")
+        if int(p["target_lag"]) < 1:
+            problems.append("target_lag must be 1 or more")
+        n_sym = len(set(p["symbols"]))
+        if no_repeat_window(p) >= n_sym:
+            problems.append(
+                f"each symbol must differ from the previous {no_repeat_window(p)}, "
+                f"but the pool only has {n_sym} distinct symbols — lower "
+                f"min_repeat_gap or add symbols")
         return problems
 
 
     def timing_summary(p):
-        """Where the response window sits relative to the rest of the schedule.
-
-        The window has to be short enough that a press cannot belong to two
-        symbols (the hard limit, enforced by check_timing), but a window that
-        merely runs past the NEXT symbol is a softer concern: a late response
-        then overlaps a symbol the participant is trying to encode. Lengthening
-        blank_dur is what buys room for longer responses.
-        """
         soa = soa_of(p)
         w = p["response_window"]
         return dict(
             symbol_dur=p["symbol_dur"],
             blank_dur=p["blank_dur"],
             soa=soa,
+            target_lag=int(p["target_lag"]),
             retention_interval=retention_interval(p),
-            empty_at_location=retention_interval(p) - p["symbol_dur"],
+            min_repeat_gap=int(p["min_repeat_gap"]),
             symbols_per_min=60.0 / soa,
             response_window=w,
             window_past_next_symbol=w - soa,
-            max_window_before_ambiguity=retention_interval(p),
+            min_target_spacing=min_gap_presentations(p) * soa,
             n_presentations=int(p["stream_duration"] // soa),
         )
 
@@ -233,11 +159,11 @@ try:
         print(f"  display {s['symbol_dur']:.2f}s + blank {s['blank_dur']:.2f}s "
               f"= SOA {s['soa']:.2f}s   ({s['symbols_per_min']:.0f} symbols/min, "
               f"{s['n_presentations']} in the run)")
-        print(f"  same position every {s['retention_interval']:.2f}s "
-              f"(the memory interval); each location empty "
-              f"{s['empty_at_location']:.2f}s")
-        print(f"  response window {s['response_window']:.2f}s "
-              f"(hard limit {s['max_window_before_ambiguity']:.2f}s)")
+        print(f"  target = repeat of the symbol {s['target_lag']} back; "
+              f"memory interval {s['retention_interval']:.2f}s")
+        print(f"  no other symbol repeats within {no_repeat_window(p)} symbols")
+        print(f"  response window {s['response_window']:.2f}s; targets at "
+              f"least {s['min_target_spacing']:.2f}s apart")
         if s["window_past_next_symbol"] > 0:
             print(f"  NOTE: the window runs {s['window_past_next_symbol']:.2f}s "
                   f"past the next symbol's onset, so a late response can overlap "
@@ -247,132 +173,82 @@ try:
         print("---------------\n")
 
 
+    def rule_text(p):
+        lag = int(p["target_lag"])
+        if lag == 1:
+            return "the same as the one just before it"
+        if lag == 2:
+            return "the same as the one TWO before it"
+        return f"the same as the one {lag} before it"
+
+
+    def data_path(subj, name):
+        # Each participant's files go in data/<participant ID>/
+        folder = os.path.join(DATA_DIR, str(subj))
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{FILE_PREFIX}_{name}")
+
+
     # ------------------------------------------------------------------ #
     #  Sequence construction                                             #
     # ------------------------------------------------------------------ #
 
     def build_sequence(rng, n_pres, p):
-        """Build the symbol stream for one run.
-
-        Positions strictly alternate, so presentation i sits at position i % 2
-        and its same-position predecessor is presentation i - 2.
-
-        Repeat events are placed first as bare slots, then labelled target or
-        lure, then symbols are filled in around them. Every non-event symbol is
-        chosen to differ from both the previous symbol and the previous symbol
-        at its own position, so the only repeats in the stream are the intended
-        ones — there are no accidental targets or lures.
-
-        Returns a list of dicts, one per presentation.
-        """
         soa = soa_of(p)
+        lag = int(p["target_lag"])
         min_gap = min_gap_presentations(p)
-        first_ok = max(2, int(np.ceil(p["first_event_min_s"] / soa)))
+        no_repeat = no_repeat_window(p)
+        first_ok = max(lag, int(np.ceil(p["first_event_min_s"] / soa)))
 
         if p["target_rate_mode"] == "per_presentation":
-            # Chance of a target per symbol is held at whatever the rate implies
-            # under the reference 1 s timing, so stream statistics stay
-            # comparable when blank_dur changes.
             n_targets = int(round(p["targets_per_min"] / 60.0 * n_pres))
-            n_lures = int(round(p["lures_per_min"] / 60.0 * n_pres))
         else:
             stream_min = (n_pres * soa) / 60.0
             n_targets = int(round(p["targets_per_min"] * stream_min))
-            n_lures = int(round(p["lures_per_min"] * stream_min))
-        n_events = n_targets + n_lures
 
         span = n_pres - first_ok
-        if n_events > 0 and span // min_gap < n_events:
-            # Requested density does not fit under the minimum-gap floor.
-            n_events = max(0, int(span // min_gap) - 1)
-            n_targets = n_events // 2
-            n_lures = n_events - n_targets
+        if n_targets > 0 and span // min_gap < n_targets:
+            n_targets = max(0, int(span // min_gap) - 1)
 
-        # Slot placement. Gaps are min_gap plus a geometric draw, which gives a
-        # flat hazard above the floor — the participant cannot learn to expect
-        # an event from how long it has been since the last one.
-        mean_gap = span / n_events if n_events else span
+        # Geometric gaps above the floor give a flat hazard, so target timing
+        # cannot be anticipated.
+        mean_gap = span / n_targets if n_targets else span
         extra = max(0.0, mean_gap - min_gap)
         p_geom = 1.0 / (1.0 + extra) if extra > 0 else 1.0
 
-        slots = []
+        slots = set()
         i = first_ok + int(rng.integers(0, min_gap + 1))
-        while i < n_pres and len(slots) < n_events:
-            slots.append(int(i))
+        while i < n_pres and len(slots) < n_targets:
+            slots.add(int(i))
             i += min_gap + int(rng.geometric(p_geom)) - 1
 
-        # Label the slots target or lure, keeping the two counts on track as we
-        # go. A slot is barred from being a target only when that would make a
-        # third consecutive same-position repeat (four identical symbols at one
-        # location); back-to-back targets 2 s apart are allowed, since 2 s is
-        # the intended minimum interval between repetitions.
-        n_slots = len(slots)
-        want_t = min(n_targets, n_slots)
-        want_l = n_slots - want_t
-        kind = {}
-        for s in sorted(slots):
-            barred = kind.get(s - 2) == "target" and kind.get(s - 4) == "target"
-            if barred or want_t <= 0:
-                lab = "lure" if want_l > 0 else "target"
-            elif want_l <= 0:
-                lab = "target"
-            else:
-                lab = "target" if rng.random() < want_t / (want_t + want_l) else "lure"
-            kind[s] = lab
-            if lab == "target":
-                want_t -= 1
-            else:
-                want_l -= 1
-
-        # Fill in symbols.
-        syms = list(p["symbols"])
+        syms = list(dict.fromkeys(p["symbols"]))
         seq_sym = [None] * n_pres
         for i in range(n_pres):
-            k = kind.get(i)
-            if k == "target":
-                seq_sym[i] = seq_sym[i - 2]
-            elif k == "lure":
-                seq_sym[i] = seq_sym[i - 1]
+            if i in slots:
+                seq_sym[i] = seq_sym[i - lag]
             else:
-                banned = set()
-                if i >= 1:
-                    banned.add(seq_sym[i - 1])
-                if i >= 2:
-                    banned.add(seq_sym[i - 2])
+                banned = set(seq_sym[max(0, i - no_repeat):i])
                 choices = [s for s in syms if s not in banned]
                 seq_sym[i] = choices[int(rng.integers(len(choices)))]
 
-        # How many symbols back at its own position each symbol last appeared.
-        # 1 is a target. 2 or more is a repeat at the same location that the
-        # confirmed rule does NOT make a target — these are left uncontrolled on
-        # purpose. Suppressing them would mean any symbol recognised at a
-        # location must be a target, which would let a participant succeed on
-        # location familiarity alone without tracking how recent it was.
-        history = {LEFT: [], RIGHT: []}
-        same_pos_lag = [0] * n_pres
-        for i in range(n_pres):
-            h = history[i % 2]
-            for back, sym in enumerate(reversed(h), start=1):
-                if sym == seq_sym[i]:
-                    same_pos_lag[i] = back
-                    break
-            h.append(seq_sym[i])
+        last_seen = {}
+        repeat_lag = [0] * n_pres
+        for i, s in enumerate(seq_sym):
+            if s in last_seen:
+                repeat_lag[i] = i - last_seen[s]
+            last_seen[s] = i
 
         stream = []
         for i in range(n_pres):
-            prev_same = seq_sym[i - 2] if i >= 2 else ""
-            prev_other = seq_sym[i - 1] if i >= 1 else ""
+            nback = seq_sym[i - lag] if i >= lag else ""
             stream.append(dict(
                 idx=i,
                 onset=i * soa,
-                position=i % 2,
                 symbol=seq_sym[i],
-                is_target=(seq_sym[i] == prev_same) if i >= 2 else False,
-                is_lure=(seq_sym[i] == prev_other) if i >= 1 else False,
-                same_pos_lag=same_pos_lag[i],
-                is_dist_repeat=(2 <= same_pos_lag[i] <= p["dist_repeat_max_lag"]),
-                prev_same=prev_same,
-                prev_other=prev_other,
+                is_target=(i >= lag and seq_sym[i] == nback),
+                nback_symbol=nback,
+                repeat_lag=repeat_lag[i],
                 responded=False,
                 rt=None,
             ))
@@ -380,31 +256,29 @@ try:
 
 
     def validate_sequence(stream, p):
-        """Check the stream obeys its own rules. Returns a list of problems."""
         problems = []
         soa = soa_of(p)
+        lag = int(p["target_lag"])
         min_gap = min_gap_presentations(p)
-
-        for s in stream:
-            if s["is_target"] and s["is_lure"]:
-                problems.append(f"presentation {s['idx']} is both target and lure")
-
-        events = [s["idx"] for s in stream if s["is_target"] or s["is_lure"]]
-        for a, b in zip(events, events[1:]):
-            if b - a < min_gap:
-                problems.append(f"events {a} and {b} are only {b - a} apart")
+        no_repeat = no_repeat_window(p)
 
         targets = [s["idx"] for s in stream if s["is_target"]]
+        for a, b in zip(targets, targets[1:]):
+            if b - a < min_gap:
+                problems.append(f"targets {a} and {b} are only {b - a} apart")
         if targets and targets[0] * soa < p["first_event_min_s"]:
             problems.append(f"first target at {targets[0] * soa:.1f}s, "
                             f"before {p['first_event_min_s']}s")
-        for a, b in zip(targets, targets[1:]):
-            if (b - a) * soa < p["min_event_gap_s"]:
-                problems.append(f"targets {a} and {b} less than "
-                                f"{p['min_event_gap_s']} s apart")
+
         for s in stream:
-            if s["is_target"] and s["position"] != stream[s["idx"] - 2]["position"]:
-                problems.append(f"target {s['idx']} is not a same-position repeat")
+            if s["is_target"]:
+                if s["repeat_lag"] != lag:
+                    problems.append(f"target {s['idx']} repeats at lag "
+                                    f"{s['repeat_lag']}, not {lag}")
+            elif 0 < s["repeat_lag"] <= no_repeat:
+                problems.append(f"presentation {s['idx']} ({s['symbol']}) "
+                                f"repeats after only {s['repeat_lag'] - 1} "
+                                f"other symbols")
         return problems
 
 
@@ -419,7 +293,7 @@ try:
             "Screen width (cm)": 52.0,
             "Viewing distance (cm)": 57.0,
         }
-        dlg = gui.DlgFromDict(info, title="VWM Repeat Detection Task")
+        dlg = gui.DlgFromDict(info, title="VWM Repeat Detection Task (centre)")
         if not dlg.OK:
             core.quit()
         return (int(info["Subject Number"]), bool(info["Run practice first"]),
@@ -427,17 +301,14 @@ try:
 
 
     def make_writers(subj):
-        """Open the event and block CSVs in append mode, writing headers if new."""
-        os.makedirs(DATA_DIR, exist_ok=True)
-
-        ev_name = os.path.join(DATA_DIR, f"VWM_s{subj}_events.csv")
+        ev_name = data_path(subj, f"s{subj}_events.csv")
         ev_new = not os.path.exists(ev_name)
         ev_file = open(ev_name, "a", newline="")
         ev_writer = csv.writer(ev_file)
         if ev_new:
             ev_writer.writerow(EVENT_FIELDS)
 
-        bk_name = os.path.join(DATA_DIR, f"VWM_s{subj}_blocks.csv")
+        bk_name = data_path(subj, f"s{subj}_blocks.csv")
         bk_new = not os.path.exists(bk_name)
         bk_file = open(bk_name, "a", newline="")
         bk_writer = csv.writer(bk_file)
@@ -448,24 +319,18 @@ try:
 
 
     def write_stream_record(subj, run_id, phase, stream):
-        """Save the whole stimulus stream, so the display can be reconstructed."""
-        os.makedirs(DATA_DIR, exist_ok=True)
-        fname = os.path.join(DATA_DIR, f"VWM_s{subj}_{run_id}_{phase}_sequence.csv")
+        fname = data_path(subj, f"s{subj}_{run_id}_{phase}_sequence.csv")
         with open(fname, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["presentation_num", "onset_s", "position", "symbol",
-                        "is_target", "is_lure", "same_pos_lag",
-                        "prev_same_pos_symbol", "prev_other_pos_symbol"])
+            w.writerow(["presentation_num", "onset_s", "symbol", "is_target",
+                        "nback_symbol", "repeat_lag"])
             for s in stream:
-                w.writerow([s["idx"], f'{s["onset"]:.3f}',
-                            "left" if s["position"] == LEFT else "right",
-                            s["symbol"], int(s["is_target"]), int(s["is_lure"]),
-                            s["same_pos_lag"],
-                            s["prev_same"], s["prev_other"]])
+                w.writerow([s["idx"], f'{s["onset"]:.3f}', s["symbol"],
+                            int(s["is_target"]), s["nback_symbol"],
+                            s["repeat_lag"]])
 
 
     def write_sidecar(subj, seed, run_id, mon_info, frmrate):
-        os.makedirs(DATA_DIR, exist_ok=True)
         payload = dict(
             run_id=run_id, subject=subj, seed=int(seed),
             started=datetime.now().isoformat(timespec="milliseconds"),
@@ -473,16 +338,14 @@ try:
             versions=dict(python=sys.version.split()[0], numpy=np.__version__,
                           platform=platform.platform()),
             params={k: (list(v) if isinstance(v, tuple) else v) for k, v in P.items()},
-            # Everything the timing implies, so a run's schedule is on record
-            # without having to recompute it from symbol_dur and blank_dur.
             timing=timing_summary(P),
             derived_timing=dict(
                 soa_s=soa_of(P),
                 retention_interval_s=retention_interval(P),
-                empty_interval_at_location_s=retention_interval(P) - P["symbol_dur"],
                 symbols_per_min=60.0 / soa_of(P),
                 n_presentations=int(P["stream_duration"] // soa_of(P)),
                 min_event_gap_presentations=min_gap_presentations(P),
+                no_repeat_window=no_repeat_window(P),
             ),
         )
         try:
@@ -490,20 +353,13 @@ try:
             payload["versions"]["psychopy"] = psychopy_version
         except Exception:
             pass
-        fname = os.path.join(DATA_DIR, f"VWM_s{subj}_{run_id}_params.json")
+        fname = data_path(subj, f"s{subj}_{run_id}_params.json")
         with open(fname, "w") as f:
             json.dump(payload, f, indent=2, default=str)
 
 
     class Feedback:
-        """Short tones fired when a response is classified.
-
-        Tones are built once and warmed at startup, because the first play on a
-        cold audio backend can take long enough to drop a frame. Every audio
-        call is guarded: if the backend is missing or fails, `ok` stays False
-        and every play() is a no-op, so the task runs silently rather than
-        crashing on a machine with no working sound.
-        """
+        """Feedback tones. Every call is a silent no-op if audio is unavailable."""
 
         def __init__(self, p):
             self.cfg = p["audio_feedback"]
@@ -519,7 +375,6 @@ try:
                          ("miss", self.cfg["miss_hz"], self.cfg["miss_secs"]))
                 for name, hz, secs in specs:
                     try:
-                        # hamming avoids the click a square-edged tone makes
                         s = sound.Sound(value=hz, secs=secs, hamming=True,
                                         volume=self.cfg["volume"], name=name)
                     except TypeError:
@@ -531,7 +386,7 @@ try:
                 print(f"[auditory feedback unavailable: {e}] — running silently")
                 return
 
-            # Warm the backend so the first real tone is not the slow one.
+            # Warm up the backend so the first real tone does not drop a frame.
             try:
                 for s in self.tones.values():
                     s.volume = 0.0
@@ -552,14 +407,13 @@ try:
             return bool(c.get(f"on_{kind}"))
 
         def play(self, kind, phase):
-            """Play the tone for `kind`; returns the name logged, or ""."""
             if not self.wanted(kind, phase):
                 return ""
             s = self.tones.get(kind)
             if s is None:
                 return ""
             try:
-                s.stop()      # so rapid repeats retrigger rather than overlap
+                s.stop()
             except Exception:
                 pass
             try:
@@ -570,27 +424,16 @@ try:
 
 
     def build_stimuli(win, p):
-        off = p["position_offset"]
-        sym = [visual.TextStim(win, text="", height=p["symbol_height"],
-                               font=p["symbol_font"],
-                               color=rgb255_to_psychopy(p["symbol_col"]),
-                               pos=(-off, 0), alignText="center", anchorHoriz="center"),
-               visual.TextStim(win, text="", height=p["symbol_height"],
-                               font=p["symbol_font"],
-                               color=rgb255_to_psychopy(p["symbol_col"]),
-                               pos=(off, 0), alignText="center", anchorHoriz="center")]
-        dot = [visual.Circle(win, radius=p["placeholder_radius"],
-                             fillColor=rgb255_to_psychopy(p["placeholder_col"]),
-                             lineColor=None, pos=(-off, 0)),
-               visual.Circle(win, radius=p["placeholder_radius"],
-                             fillColor=rgb255_to_psychopy(p["placeholder_col"]),
-                             lineColor=None, pos=(off, 0))]
-        mask = [visual.Circle(win, radius=p["mask_radius"],
-                              fillColor=rgb255_to_psychopy(p["mask_col"]),
-                              lineColor=None, pos=(-off, 0)),
-                visual.Circle(win, radius=p["mask_radius"],
-                              fillColor=rgb255_to_psychopy(p["mask_col"]),
-                              lineColor=None, pos=(off, 0))]
+        sym = visual.TextStim(win, text="", height=p["symbol_height"],
+                              font=p["symbol_font"],
+                              color=rgb255_to_psychopy(p["symbol_col"]),
+                              pos=(0, 0), alignText="center", anchorHoriz="center")
+        dot = visual.Circle(win, radius=p["placeholder_radius"],
+                            fillColor=rgb255_to_psychopy(p["placeholder_col"]),
+                            lineColor=None, pos=(0, 0))
+        mask = visual.Circle(win, radius=p["mask_radius"],
+                             fillColor=rgb255_to_psychopy(p["mask_col"]),
+                             lineColor=None, pos=(0, 0))
         text = visual.TextStim(win, text="", color="black", height=24, wrapWidth=900)
         return sym, dot, mask, text
 
@@ -601,25 +444,10 @@ try:
 
     def run_stream(win, kb, stim, p, stream, duration, phase, log_event,
                    feedback=None, out=None):
-        """Present one continuous stream and score responses against it.
-
-        The display is driven from elapsed time rather than a frame count, so
-        the schedule cannot drift: on every frame the current presentation is
-        floor(t / soa), and its symbol is visible for the first symbol_dur of
-        that interval.
-
-        A keypress is attributed to the most recent target whose response
-        window is still open. Because repeat events are at least 2 s apart and
-        the window is shorter than that, at most one target can be open at a
-        time and the attribution is never ambiguous.
-
-        `out` is filled in the finally block so a summary survives an abort.
-        """
         sym_stim, dot_stim, mask_stim, text = stim
         soa, sdur = soa_of(p), p["symbol_dur"]
         window = p["response_window"]
         n_pres = len(stream)
-        # How many presentations back a still-open response window can reach.
         lookback = int(np.ceil(window / soa)) + 1
 
         events_log = []
@@ -637,27 +465,16 @@ try:
             ev = blank_event(etype)
             ev["presentation_num"] = s["idx"]
             ev["onset_s"] = f'{s["onset"]:.4f}'
-            ev["position"] = "left" if s["position"] == LEFT else "right"
             ev["symbol"] = s["symbol"]
-            ev["prev_same_pos_symbol"] = s["prev_same"]
-            ev["prev_other_pos_symbol"] = s["prev_other"]
-            ev["same_pos_lag"] = s["same_pos_lag"]
+            ev["nback_symbol"] = s["nback_symbol"]
             return ev
 
-        n_hits = n_fa = n_dup = n_other = n_lure_fa = n_dist_fa = 0
+        n_hits = n_fa = n_dup = n_other = 0
         n_frames = 0
         rts = []
-        rt_times = []
-
-        # Onsets of lures and of same-position repeats that are not targets,
-        # so a false alarm can be attributed to the thing that likely caused it.
-        lure_onsets = [s["onset"] for s in stream if s["is_lure"]]
-        dist_onsets = [s["onset"] for s in stream if s["is_dist_repeat"]]
 
         if feedback is None:
             feedback = Feedback(dict(audio_feedback=dict(enabled=False)))
-        # Targets in onset order, walked by a pointer so a miss tone can fire
-        # the moment a window closes unanswered rather than at stream end.
         target_idxs = [s["idx"] for s in stream if s["is_target"]]
         miss_ptr = 0
         miss_toned = set()
@@ -667,32 +484,34 @@ try:
         clock = core.Clock()
         completed = False
         last_drawn = None
+        loaded_symbol = None
 
         try:
+            # Driven by elapsed time rather than frame count, so the schedule
+            # cannot drift.
             while clock.getTime() < duration:
                 n_frames += 1
                 t = clock.getTime()
                 i = int(t // soa)
                 if i >= n_pres:
                     break
-                phase_t = t - i * soa
-                showing = phase_t < sdur
+                showing = (t - i * soa) < sdur
                 cur = stream[i]
-                pos = cur["position"]
 
-                # --- draw -------------------------------------------------
-                for k in (LEFT, RIGHT):
-                    if k == pos and showing:
-                        sym_stim[k].text = cur["symbol"]
-                        sym_stim[k].draw()
-                    else:
-                        if p["use_mask"]:
-                            mask_stim[k].draw()
-                        if p["show_placeholder"]:
-                            dot_stim[k].draw()
+                if showing:
+                    # Re-rendering text every frame can drop frames; only
+                    # update it when the symbol changes.
+                    if loaded_symbol != cur["symbol"]:
+                        sym_stim.text = cur["symbol"]
+                        loaded_symbol = cur["symbol"]
+                    sym_stim.draw()
+                else:
+                    if p["use_mask"]:
+                        mask_stim.draw()
+                    if p["show_placeholder"]:
+                        dot_stim.draw()
                 win.flip()
 
-                # --- responses --------------------------------------------
                 keys = kb.getKeys(waitRelease=False)
                 for k in keys:
                     if k.name == "escape":
@@ -705,18 +524,19 @@ try:
                         emit(ev)
                         continue
 
-                    # Timestamp from the keyboard where it is trustworthy.
+                    # Keyboard timestamps share the core clock; convert to
+                    # stream time.
                     t_now = clock.getTime()
                     tk = getattr(k, "tDown", None)
                     if tk is not None and np.isfinite(tk):
-                        # kb timestamps share the core clock; convert to stream time
                         t_press = t_now - (core.getTime() - tk)
                         if not (0.0 <= t_press <= t_now + 0.001):
                             t_press = t_now
                     else:
                         t_press = t_now
 
-                    # Most recent target with an open window.
+                    # Attribute the press to the most recent target whose
+                    # response window is still open.
                     j = int(t_press // soa)
                     hit_on = None
                     for cand in range(j, max(-1, j - lookback - 1), -1):
@@ -728,18 +548,10 @@ try:
                             break
 
                     if hit_on is None:
-                        near = any(0 <= t_press - lo <= window for lo in lure_onsets)
-                        near_d = any(0 <= t_press - lo <= window for lo in dist_onsets)
-                        if near:
-                            n_lure_fa += 1
-                        if near_d:
-                            n_dist_fa += 1
                         n_fa += 1
                         ev = blank_event("False Alarm")
                         ev["key_name"] = p["response_key"]
                         ev["press_time_s"] = f"{t_press:.4f}"
-                        ev["near_lure"] = int(near)
-                        ev["near_dist_repeat"] = int(near_d)
                         ev["feedback_tone"] = feedback.play("false_alarm", phase)
                         emit(ev)
                     elif hit_on["responded"]:
@@ -754,7 +566,6 @@ try:
                         rt = (t_press - hit_on["onset"]) * 1000.0
                         hit_on["rt"] = rt
                         rts.append(rt)
-                        rt_times.append(hit_on["onset"])
                         n_hits += 1
                         ev = presentation_row(hit_on, "Hit")
                         ev["key_name"] = p["response_key"]
@@ -767,9 +578,6 @@ try:
                         ev["feedback_tone"] = feedback.play("hit", phase)
                         emit(ev)
 
-                # A target whose window has closed with no press is a miss now,
-                # not at stream end, so the tone lands while it still means
-                # something to the participant.
                 if feedback.wanted("miss", phase):
                     while miss_ptr < len(target_idxs):
                         s = stream[target_idxs[miss_ptr]]
@@ -788,7 +596,6 @@ try:
             elapsed = clock.getTime()
             shown = (last_drawn + 1) if last_drawn is not None else 0
 
-            # Targets that were presented but never answered.
             n_targets = 0
             n_misses = 0
             for s in stream[:shown]:
@@ -802,14 +609,6 @@ try:
                     ev["feedback_tone"] = "miss" if s["idx"] in miss_toned else ""
                     emit(ev)
 
-            # One row per lure, so lure-driven false alarms can be matched up.
-            n_lures = 0
-            for s in stream[:shown]:
-                if s["is_lure"]:
-                    n_lures += 1
-                    ev = presentation_row(s, "Lure")
-                    emit(ev)
-
             ev = blank_event("Stream End" if completed else "Stream Aborted")
             ev["press_time_s"] = f"{elapsed:.4f}"
             emit(ev)
@@ -821,8 +620,6 @@ try:
             except Exception:
                 n_dropped = ""
 
-            # Split the run in half by target onset so a decline over time is
-            # visible straight from the block row.
             half = elapsed / 2.0 if elapsed else 0.0
             t_h1 = [s for s in stream[:shown] if s["is_target"] and s["onset"] < half]
             t_h2 = [s for s in stream[:shown] if s["is_target"] and s["onset"] >= half]
@@ -830,17 +627,14 @@ try:
                 return (sum(1 for x in ts if x["responded"]) / len(ts)) if ts else ""
             rt_h1 = [x["rt"] for x in t_h1 if x["rt"] is not None]
             rt_h2 = [x["rt"] for x in t_h2 if x["rt"] is not None]
-            n_dist = sum(1 for s in stream[:shown] if s["is_dist_repeat"])
 
             summary = dict(
                 phase=phase, elapsed=elapsed, n_presentations=shown,
                 hit_rate_h1=_hr(t_h1), hit_rate_h2=_hr(t_h2),
                 mean_rt_h1=(float(np.mean(rt_h1)) if rt_h1 else ""),
                 mean_rt_h2=(float(np.mean(rt_h2)) if rt_h2 else ""),
-                n_dist_repeats=n_dist, n_dist_fa=n_dist_fa,
                 n_frames=n_frames, n_targets=n_targets, n_hits=n_hits,
-                n_misses=n_misses, n_lures=n_lures, n_lure_fa=n_lure_fa,
-                n_fa=n_fa, n_dup=n_dup, n_other=n_other,
+                n_misses=n_misses, n_fa=n_fa, n_dup=n_dup, n_other=n_other,
                 hit_rate=(n_hits / n_targets) if n_targets else "",
                 mean_rt=(float(np.mean(rts)) if rts else ""),
                 median_rt=(float(np.median(rts)) if rts else ""),
@@ -872,12 +666,12 @@ try:
     # ------------------------------------------------------------------ #
 
     def main():
-        bad = check_timing(P)
+        bad = check_params(P)
         if bad:
-            print("\n--- TIMING PARAMETERS REJECTED ---")
+            print("\n--- PARAMETERS REJECTED ---")
             for b in bad:
                 print("   ", b)
-            print("----------------------------------\n")
+            print("---------------------------\n")
             sys.exit(1)
 
         print_timing(P)
@@ -918,12 +712,10 @@ try:
 
         instr = (
             "Visual Working Memory: Repeat Detection\n\n"
-            "Letters and numbers will appear one at a time, alternating between\n"
-            "a LEFT and a RIGHT position.\n\n"
-            "Press the SPACEBAR as soon as a symbol repeats "
-            "AT THE SAME POSITION\nas the symbol shown there before it.\n\n"
-            "A symbol that repeats at the OTHER position is not a target — "
-            "ignore it.\n\n"
+            "Letters and numbers will appear one at a time\n"
+            "in the centre of the screen.\n\n"
+            "Press the SPACEBAR as soon as a symbol is\n"
+            f"{rule_text(P)}.\n\n"
             "Respond as quickly as you can.\n\n"
             "Press any key to begin."
         )
@@ -934,8 +726,6 @@ try:
 
         exp_start = core.getTime()
         try:
-            # Practice may run more than once if the participant has clearly
-            # not grasped the rule; each repeat gets a fresh sequence.
             phases = []
             if do_practice:
                 for k in range(max(1, int(P["practice_max_runs"]))):
@@ -949,7 +739,7 @@ try:
             for phase, duration, prng in phases:
                 if phase == "practice":
                     if practice_done >= n_practice_total:
-                        continue          # criterion already met
+                        continue
                     practice_done += 1
                 n_pres = int(duration // soa_of(P))
                 stream = build_sequence(prng, n_pres, P)
@@ -989,7 +779,6 @@ try:
                             f'{result["elapsed"]:.3f}', result["n_presentations"],
                             result["n_frames"], result["n_targets"],
                             result["n_hits"], result["n_misses"],
-                            result["n_lures"], result["n_lure_fa"],
                             result["n_fa"], result["n_dup"], result["n_other"],
                             (f'{result["hit_rate"]:.4f}'
                              if result["hit_rate"] != "" else ""),
@@ -1005,7 +794,6 @@ try:
                              if result["mean_rt_h1"] != "" else ""),
                             (f'{result["mean_rt_h2"]:.1f}'
                              if result["mean_rt_h2"] != "" else ""),
-                            result["n_dist_repeats"], result["n_dist_fa"],
                             (f'{result["n_fa"] / (result["elapsed"] / 60.0):.2f}'
                              if result["elapsed"] > 0 else ""),
                             f'{result["time_at_risk"]:.3f}',
@@ -1015,7 +803,6 @@ try:
                         ])
                         bk_file.flush()
 
-                # Summary after practice only — nothing interrupts the test stream.
                 if phase == "practice" and result:
                     hr = result["hit_rate"]
                     n_practice = sum(1 for x in phases if x[0] == "practice")
@@ -1023,7 +810,8 @@ try:
                              and practice_done < n_practice)
                     tail = ("It looks like the rule may not be clear yet, so we "
                             "will run the practice once more.\n\n"
-                            "Remember: only a repeat at the SAME position counts."
+                            f"Remember: press only when a symbol is "
+                            f"{rule_text(P)}."
                             if retry else "")
                     show_text(win, text,
                               "Practice complete.\n\n"
@@ -1033,7 +821,6 @@ try:
                               f"Presses with no repeat: {result['n_fa']}\n\n"
                               + tail + "\n\nPress any key to continue.")
                     if not retry:
-                        # Good enough — drop any remaining practice runs.
                         practice_done = n_practice
 
             show_text(win, text,
@@ -1048,7 +835,7 @@ try:
             print("---------------------\n")
         finally:
             try:
-                fname = os.path.join(DATA_DIR, f"VWM_s{subj}_{run_id}_params.json")
+                fname = data_path(subj, f"s{subj}_{run_id}_params.json")
                 with open(fname) as f:
                     payload = json.load(f)
                 payload["instruction_screen_secs"] = round(instr_secs, 3)
