@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
+# Visual working memory repeat-detection task (2-back).
+# Letters and digits appear one at a time at the centre of the screen, each
+# followed by a blank ISI drawn from a truncated normal distribution.
+# Participants press SPACE when a symbol matches the one two before it.
+# A short practice block (repeated once if performance is low) precedes a
+# 15-minute test block. Data are saved to data/<subject>/.
 
 import traceback
 import sys
+import bisect
 
 try:
     from psychopy import visual, core, event, gui, monitors
@@ -14,53 +21,88 @@ try:
     import platform
     from datetime import datetime
 
+    # ---- Parameters ----
     P = dict(
-        # --- Timing ---
-        # Memory interval = target_lag x (symbol_dur + blank_dur).
-        # blank_dur is the manipulated variable; symbol_dur stays fixed.
-        symbol_dur=0.5,
-        blank_dur=0.5,
-        stream_duration=300.0,
+        # Timing (seconds). Each symbol is shown for symbol_dur, then a blank
+        # ISI drawn from N(isi_mean, isi_sd); draws outside the ISI limits are
+        # redrawn. isi_sd=0 gives a fixed ISI.
+        symbol_dur=0.25,
+        symbol_round_to_frames=True,  # snap symbol_dur to whole frames at the measured refresh rate
+        isi_mean=2.0,
+        isi_sd=0.3,
+        isi_trunc_sd=1.0,       # ISI limits = isi_mean +/- isi_trunc_sd * isi_sd (follows the mean automatically)
+        isi_min=None,           # only used if isi_trunc_sd is None: fixed limits in seconds
+        isi_max=None,
+        isi_round_to_frames=True,     # snap each ISI to whole frames
+        stream_duration=900.0,
         practice_duration=45.0,
         run_practice=True,
-        practice_max_runs=2,          # 1 disables the practice retry
+        practice_max_runs=2,
         practice_pass_hit_rate=0.5,
 
-        # --- Response ---
+        # Response
         response_key="space",
-        response_window=1.5,          # seconds after target onset that count as a hit
-        # A press this many seconds after the hit window closes is logged as a
-        # late response to that target, not a false alarm. 0 turns this off.
-        late_response_window=1.0,
+        response_window=1.5,
+        late_response_window=1.0,     # presses this long after the hit window count as late, not FA
 
-        # --- Sequence ---
-        target_lag=1,                 # 1 = same as previous symbol, 2 = same as two back
-        targets_per_min=10.0,
-        # "per_minute": fixed targets per minute; "per_presentation": fixed
-        # chance per symbol. The two diverge when blank_dur changes.
-        target_rate_mode="per_minute",
-        min_repeat_gap=10,            # non-targets never repeat within this many symbols
+        # Sequence
+        target_lag=2,                 # n in n-back
+        targets_per_min=15.0,
+        target_rate_mode="per_presentation",  # or "per_minute"
+        min_repeat_gap=10,
         min_event_gap_s=2.0,
         first_event_min_s=6.0,
-        # Visually confusable characters (B G I L O Q S Z 0 1 2 5 6 8) excluded.
-        symbols="ACDEFHJKMNPRTUVWXY3479",
+        symbols="ACDEFHJKMNPRTUVWXY3479",  # visually confusable characters excluded
 
-        # --- Display ---
-        symbol_height=64,
+        # Display (pixels, RGB 0-255)
+        symbol_height=200,
         symbol_font="Arial",
         symbol_col=(0, 0, 0),
         bkgd_col=(160, 160, 160),
-        show_placeholder=True,        # fixation dot during blanks
+        show_placeholder=True,
         placeholder_radius=5,
         placeholder_col=(90, 90, 90),
-        use_mask=False,               # low-contrast mask during blanks
-        mask_radius=42,
+        use_mask=False,
+        mask_radius=84,
         mask_col=(140, 140, 140),
 
         frmrate_expected=60,
         practice_seed_offset=100000,
     )
 
+    # ---- macOS pyglet fix ----
+    # pyglet 1.5 on macOS can reuse a stale event wrapper and crash mid-run
+    # ("ObjCInstance ... has no attribute b'type'"); this clears stale wrappers.
+    def patch_pyglet_macos():
+        if sys.platform != "darwin":
+            return False
+        try:
+            from ctypes import c_void_p
+            from pyglet.libs.darwin.cocoapy import runtime
+            original_new = runtime.ObjCInstance.__new__
+
+            def checked_new(cls, object_ptr):
+                if not isinstance(object_ptr, c_void_p):
+                    object_ptr = c_void_p(object_ptr)
+                cached = cls._cached_objects.get(object_ptr.value)
+                if (cached is not None and runtime.objc.object_getClass(object_ptr)
+                        != cached.objc_class.ptr.value):
+                    del cls._cached_objects[object_ptr.value]
+                return original_new(cls, object_ptr)
+
+            runtime.ObjCInstance.__new__ = staticmethod(checked_new)
+            return True
+        except Exception as e:
+            print(f"[could not apply the macOS pyglet fix: {e}]")
+            return False
+
+    PYGLET_MAC_FIX = patch_pyglet_macos()
+
+
+    def is_pyglet_mac_glitch(err):
+        return isinstance(err, AttributeError) and "ObjCInstance" in str(err)
+
+    # ---- Data files ----
     DATA_DIR = "data"
     FILE_PREFIX = "VWMcentre"
 
@@ -68,6 +110,7 @@ try:
         "datetime", "run_id", "subject", "practice", "seed", "phase",
         "event_num", "event_type",
         "presentation_num", "onset_s", "symbol", "nback_symbol",
+        "isi_before_s", "retention_s",
         "key_name", "press_time_s", "rt_ms", "responded", "late_response",
         "attributed_to_presentation", "presentations_after_target",
     ]
@@ -84,8 +127,8 @@ try:
     ]
 
 
+    # ---- Helpers ----
     class AbortExperiment(Exception):
-        """Raised on escape so data is saved before quitting."""
         pass
 
 
@@ -100,7 +143,15 @@ try:
 
 
     def soa_of(p):
-        return p["symbol_dur"] + p["blank_dur"]
+        return p["symbol_dur"] + p["isi_mean"]
+
+
+    def min_soa(p):
+        return p["symbol_dur"] + p["isi_min"]
+
+
+    def max_soa(p):
+        return p["symbol_dur"] + p["isi_max"]
 
 
     def retention_interval(p):
@@ -108,22 +159,53 @@ try:
 
 
     def no_repeat_window(p):
-        # Never less than target_lag, so fillers cannot create accidental targets.
         return max(int(p["min_repeat_gap"]), int(p["target_lag"]))
 
 
     def min_gap_presentations(p):
-        # Also guarantees that response windows of successive targets never overlap.
-        soa = soa_of(p)
+        soa = min_soa(p)
         return max(int(p["target_lag"]) + 1,
                    int(np.ceil(p["min_event_gap_s"] / soa)),
                    int(np.ceil(p["response_window"] / soa)))
 
 
+    # ---- Timing and parameter checks ----
+    def frame_dur(p):
+        return 1.0 / float(p.get("frmrate_measured") or p["frmrate_expected"])
+
+
+    def resolve_timing(p):
+        """Work out the ISI limits and the frame-snapped symbol duration from
+        the parameters. Called at startup and again once the refresh rate has
+        been measured. The requested symbol duration is kept separately."""
+        if p.get("isi_trunc_sd") is not None:
+            k = float(p["isi_trunc_sd"])
+            p["isi_min"] = float(p["isi_mean"]) - k * float(p["isi_sd"])
+            p["isi_max"] = float(p["isi_mean"]) + k * float(p["isi_sd"])
+        req = p.setdefault("symbol_dur_requested", p["symbol_dur"])
+        if p.get("symbol_round_to_frames", False) and req > 0:
+            fd = frame_dur(p)
+            p["symbol_dur"] = max(1, int(round(req / fd))) * fd
+        else:
+            p["symbol_dur"] = req
+
+
     def check_params(p):
         problems = []
-        if p["blank_dur"] <= 0 or p["symbol_dur"] <= 0:
-            problems.append("symbol_dur and blank_dur must both be positive")
+        if p["symbol_dur"] <= 0:
+            problems.append("symbol_dur must be positive")
+        if p["isi_sd"] < 0:
+            problems.append("isi_sd cannot be negative")
+        if p.get("isi_trunc_sd") is not None and p["isi_trunc_sd"] < 0:
+            problems.append("isi_trunc_sd cannot be negative")
+        if p["isi_min"] is None or p["isi_max"] is None:
+            problems.append("set isi_trunc_sd, or set both isi_min and isi_max")
+        elif not (0 < p["isi_min"] <= p["isi_mean"] <= p["isi_max"]):
+            problems.append(
+                f"ISI limits {p['isi_min']:.3f}-{p['isi_max']:.3f}s must satisfy "
+                f"0 < isi_min <= isi_mean <= isi_max (with isi_trunc_sd, the "
+                f"lower limit is isi_mean - isi_trunc_sd * isi_sd, so it must "
+                f"stay above zero)")
         if p["response_window"] <= 0:
             problems.append("response_window must be positive")
         if p["late_response_window"] < 0:
@@ -141,31 +223,52 @@ try:
 
     def timing_summary(p):
         soa = soa_of(p)
+        lag = int(p["target_lag"])
         w = p["response_window"]
         return dict(
             symbol_dur=p["symbol_dur"],
-            blank_dur=p["blank_dur"],
-            soa=soa,
-            target_lag=int(p["target_lag"]),
-            retention_interval=retention_interval(p),
+            isi_mean=p["isi_mean"],
+            isi_sd=p["isi_sd"],
+            isi_min=p["isi_min"],
+            isi_max=p["isi_max"],
+            soa_mean=soa,
+            soa_min=min_soa(p),
+            soa_max=max_soa(p),
+            target_lag=lag,
+            retention_interval_mean=retention_interval(p),
+            retention_interval_min=lag * min_soa(p),
+            retention_interval_max=lag * max_soa(p),
             min_repeat_gap=int(p["min_repeat_gap"]),
             symbols_per_min=60.0 / soa,
             response_window=w,
             late_response_window=p["late_response_window"],
-            window_past_next_symbol=w - soa,
-            min_target_spacing=min_gap_presentations(p) * soa,
-            n_presentations=int(p["stream_duration"] // soa),
+            window_past_next_symbol=w - min_soa(p),
+            min_target_spacing=min_gap_presentations(p) * min_soa(p),
+            n_presentations_approx=int(p["stream_duration"] // soa),
         )
 
 
     def print_timing(p):
         s = timing_summary(p)
         print("\n--- timing ---")
-        print(f"  display {s['symbol_dur']:.2f}s + blank {s['blank_dur']:.2f}s "
-              f"= SOA {s['soa']:.2f}s   ({s['symbols_per_min']:.0f} symbols/min, "
-              f"{s['n_presentations']} in the run)")
-        print(f"  target = repeat of the symbol {s['target_lag']} back; "
-              f"memory interval {s['retention_interval']:.2f}s")
+        fd = frame_dur(p)
+        req = p.get("symbol_dur_requested", p["symbol_dur"])
+        print(f"  refresh {1.0 / fd:.2f} Hz ({fd * 1000:.2f} ms/frame); symbol "
+              f"{p['symbol_dur'] * 1000:.1f} ms "
+              f"(~{p['symbol_dur'] / fd:.2f} frames)")
+        if abs(req - p["symbol_dur"]) > 1e-6:
+            print(f"  NOTE: symbol_dur {req * 1000:.1f} ms is not a whole number "
+                  f"of frames, so it was snapped to {p['symbol_dur'] * 1000:.1f} ms")
+        print(f"  display {s['symbol_dur']:.3f}s, then a blank ISI drawn from "
+              f"N({s['isi_mean']:.2f}, {s['isi_sd']:.2f})s, kept within "
+              f"{s['isi_min']:.2f}-{s['isi_max']:.2f}s")
+        print(f"  SOA {s['soa_min']:.2f}-{s['soa_max']:.2f}s, mean "
+              f"{s['soa_mean']:.2f}s   ({s['symbols_per_min']:.0f} symbols/min, "
+              f"about {s['n_presentations_approx']} in the run)")
+        print(f"  target = repeat of the symbol {s['target_lag']} back; memory "
+              f"interval {s['retention_interval_min']:.2f}-"
+              f"{s['retention_interval_max']:.2f}s, mean "
+              f"{s['retention_interval_mean']:.2f}s")
         print(f"  no other symbol repeats within {no_repeat_window(p)} symbols")
         print(f"  response window {s['response_window']:.2f}s; targets at "
               f"least {s['min_target_spacing']:.2f}s apart")
@@ -174,9 +277,9 @@ try:
                   f"{s['response_window'] + s['late_response_window']:.2f}s "
                   f"after a target are logged as late responses")
         if s["window_past_next_symbol"] > 0:
-            print(f"  NOTE: the window runs {s['window_past_next_symbol']:.2f}s "
-                  f"past the next symbol's onset, so a late response can overlap "
-                  f"the following symbol. Lengthen blank_dur to buy room.")
+            print(f"  NOTE: the window can run up to "
+                  f"{s['window_past_next_symbol']:.2f}s past the next symbol's "
+                  f"onset, so a late response can overlap the following symbol.")
         else:
             print("  the window closes before the next symbol appears")
         print("---------------\n")
@@ -191,44 +294,78 @@ try:
         return f"the same as the one {lag} before it"
 
 
+    def duration_text(secs):
+        if secs < 60:
+            return f"{secs:g} seconds"
+        mins = secs / 60
+        return f"{mins:g} minute" + ("" if mins == 1 else "s")
+
+
     def data_path(subj, name):
-        # Each participant's files go in data/<participant ID>/
         folder = os.path.join(DATA_DIR, str(subj))
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, f"{FILE_PREFIX}_{name}")
 
 
-    # ------------------------------------------------------------------ #
-    #  Sequence construction                                             #
-    # ------------------------------------------------------------------ #
+    # ---- Sequence construction ----
+    def draw_isis(rng, n, p):
+        mean, sd = float(p["isi_mean"]), float(p["isi_sd"])
+        lo, hi = float(p["isi_min"]), float(p["isi_max"])
+        if sd <= 0 or hi <= lo:
+            isis = np.full(n, mean)
+        else:
+            isis = rng.normal(mean, sd, n)
+            bad = (isis < lo) | (isis > hi)
+            while bad.any():
+                isis[bad] = rng.normal(mean, sd, int(bad.sum()))
+                bad = (isis < lo) | (isis > hi)
+        if p.get("isi_round_to_frames", False):   # so logged ISIs match what was shown
+            fd = 1.0 / float(p.get("frmrate_measured") or p["frmrate_expected"])
+            frames = np.round(isis / fd)
+            f_lo, f_hi = np.ceil(lo / fd - 1e-6), np.floor(hi / fd + 1e-6)
+            if f_lo <= f_hi:
+                frames = np.clip(frames, f_lo, f_hi)
+            isis = frames * fd
+        return isis
 
-    def build_sequence(rng, n_pres, p):
-        soa = soa_of(p)
+
+    def build_sequence(rng, duration, p):
+        sdur = p["symbol_dur"]
         lag = int(p["target_lag"])
         min_gap = min_gap_presentations(p)
         no_repeat = no_repeat_window(p)
-        first_ok = max(lag, int(np.ceil(p["first_event_min_s"] / soa)))
-        # The last target must leave its full hit and late windows before the
-        # stream ends, or a timely press could never be recorded.
-        last_ok = int(np.floor(
-            n_pres - (p["response_window"] + p["late_response_window"]) / soa))
+
+        n_max = int(np.ceil(duration / min_soa(p))) + 1
+        isis = draw_isis(rng, n_max, p)
+        onsets = np.concatenate([[0.0], np.cumsum(sdur + isis)[:-1]])
+        ends = onsets + sdur + isis
+        n_pres = int(np.sum(ends <= duration + 1e-9))
+        onsets, ends, isis = onsets[:n_pres], ends[:n_pres], isis[:n_pres]
+        stream_end = float(ends[-1]) if n_pres else 0.0
+
+        first_ok = max(lag, int(np.searchsorted(
+            onsets, p["first_event_min_s"] - 1e-9, side="left")))
+        last_ok = int(np.searchsorted(
+            onsets,
+            stream_end - (p["response_window"] + p["late_response_window"]) + 1e-9,
+            side="right")) - 1
 
         if p["target_rate_mode"] == "per_presentation":
             n_targets = int(round(p["targets_per_min"] / 60.0 * n_pres))
         else:
-            stream_min = (n_pres * soa) / 60.0
-            n_targets = int(round(p["targets_per_min"] * stream_min))
+            n_targets = int(round(p["targets_per_min"] * stream_end / 60.0))
 
         span = last_ok + 1 - first_ok
-        if n_targets > 0 and span // min_gap < n_targets:
+        if span <= 0:
+            n_targets = 0
+        elif n_targets > 0 and span // min_gap < n_targets:
             n_targets = max(0, int(span // min_gap) - 1)
 
-        # Geometric gaps above the floor give a flat hazard, so target timing
-        # cannot be anticipated.
         mean_gap = span / n_targets if n_targets else span
         extra = max(0.0, mean_gap - min_gap)
         p_geom = 1.0 / (1.0 + extra) if extra > 0 else 1.0
 
+        # Geometric gaps above min_gap give a flat hazard, so targets can't be anticipated.
         slots = set()
         i = first_ok + int(rng.integers(0, min_gap + 1))
         while i <= last_ok and len(slots) < n_targets:
@@ -257,7 +394,11 @@ try:
             nback = seq_sym[i - lag] if i >= lag else ""
             stream.append(dict(
                 idx=i,
-                onset=i * soa,
+                onset=float(onsets[i]),
+                end=float(ends[i]),
+                isi_after=float(isis[i]),
+                isi_before=float(isis[i - 1]) if i > 0 else None,
+                retention=float(onsets[i] - onsets[i - lag]) if i >= lag else None,
                 symbol=seq_sym[i],
                 is_target=(i >= lag and seq_sym[i] == nback),
                 nback_symbol=nback,
@@ -271,25 +412,32 @@ try:
 
     def validate_sequence(stream, p):
         problems = []
-        soa = soa_of(p)
         lag = int(p["target_lag"])
         min_gap = min_gap_presentations(p)
         no_repeat = no_repeat_window(p)
+        min_spacing_s = max(p["min_event_gap_s"], p["response_window"])
 
         targets = [s["idx"] for s in stream if s["is_target"]]
         for a, b in zip(targets, targets[1:]):
             if b - a < min_gap:
                 problems.append(f"targets {a} and {b} are only {b - a} apart")
-        if targets and targets[0] * soa < p["first_event_min_s"]:
-            problems.append(f"first target at {targets[0] * soa:.1f}s, "
+            gap_s = stream[b]["onset"] - stream[a]["onset"]
+            if gap_s < min_spacing_s - 1e-9:
+                problems.append(f"targets {a} and {b} are only {gap_s:.2f}s apart")
+        if targets and stream[targets[0]]["onset"] < p["first_event_min_s"] - 1e-9:
+            problems.append(f"first target at {stream[targets[0]]['onset']:.1f}s, "
                             f"before {p['first_event_min_s']}s")
-        end = len(stream) * soa
-        if targets and (targets[-1] * soa + p["response_window"]
+        end = stream[-1]["end"] if stream else 0.0
+        if targets and (stream[targets[-1]]["onset"] + p["response_window"]
                         + p["late_response_window"] > end + 1e-9):
-            problems.append(f"last target at {targets[-1] * soa:.1f}s cannot be "
-                            f"fully answered before the stream ends at {end:.1f}s")
+            problems.append(f"last target at {stream[targets[-1]]['onset']:.1f}s "
+                            f"cannot be fully answered before the stream ends "
+                            f"at {end:.1f}s")
 
         for s in stream:
+            if not (p["isi_min"] - 1e-6 <= s["isi_after"] <= p["isi_max"] + 1e-6):
+                problems.append(f"presentation {s['idx']} has an ISI of "
+                                f"{s['isi_after']:.3f}s, outside the limits")
             if s["is_target"]:
                 if s["repeat_lag"] != lag:
                     problems.append(f"target {s['idx']} repeats at lag "
@@ -301,10 +449,7 @@ try:
         return problems
 
 
-    # ------------------------------------------------------------------ #
-    #  Setup                                                             #
-    # ------------------------------------------------------------------ #
-
+    # ---- Setup ----
     def get_subject_info():
         info = {
             "Subject Number": 1,
@@ -320,7 +465,6 @@ try:
 
 
     def open_csv(path, header):
-        # A file written with different columns is renamed, not appended to.
         if os.path.exists(path):
             with open(path, newline="") as f:
                 existing = next(csv.reader(f), None)
@@ -345,16 +489,22 @@ try:
         return ev_file, ev_writer, bk_file, bk_writer
 
 
+    def fmt_s(x):
+        return "" if x is None else f"{x:.4f}"
+
+
     def write_stream_record(subj, run_id, phase, stream):
         fname = data_path(subj, f"s{subj}_{run_id}_{phase}_sequence.csv")
         with open(fname, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["presentation_num", "onset_s", "symbol", "is_target",
-                        "nback_symbol", "repeat_lag"])
+                        "nback_symbol", "repeat_lag", "isi_before_s",
+                        "isi_after_s", "retention_s"])
             for s in stream:
-                w.writerow([s["idx"], f'{s["onset"]:.3f}', s["symbol"],
+                w.writerow([s["idx"], f'{s["onset"]:.4f}', s["symbol"],
                             int(s["is_target"]), s["nback_symbol"],
-                            s["repeat_lag"]])
+                            s["repeat_lag"], fmt_s(s["isi_before"]),
+                            fmt_s(s["isi_after"]), fmt_s(s["retention"])])
 
 
     def write_sidecar(subj, seed, run_id, mon_info, frmrate):
@@ -367,10 +517,12 @@ try:
             params={k: (list(v) if isinstance(v, tuple) else v) for k, v in P.items()},
             timing=timing_summary(P),
             derived_timing=dict(
-                soa_s=soa_of(P),
-                retention_interval_s=retention_interval(P),
+                soa_mean_s=soa_of(P),
+                soa_min_s=min_soa(P),
+                soa_max_s=max_soa(P),
+                retention_interval_mean_s=retention_interval(P),
                 symbols_per_min=60.0 / soa_of(P),
-                n_presentations=int(P["stream_duration"] // soa_of(P)),
+                n_presentations_approx=int(P["stream_duration"] // soa_of(P)),
                 min_event_gap_presentations=min_gap_presentations(P),
                 no_repeat_window=no_repeat_window(P),
             ),
@@ -400,18 +552,17 @@ try:
         return sym, dot, mask, text
 
 
-    # ------------------------------------------------------------------ #
-    #  The stream                                                        #
-    # ------------------------------------------------------------------ #
-
+    # ---- Stream ----
     def run_stream(win, kb, stim, p, stream, duration, phase, log_event,
                    out=None):
         sym_stim, dot_stim, mask_stim, text = stim
-        soa, sdur = soa_of(p), p["symbol_dur"]
+        sdur = p["symbol_dur"]
         window = p["response_window"]
         late_win = p["late_response_window"]
         n_pres = len(stream)
-        lookback = int(np.ceil((window + late_win) / soa)) + 1
+        onsets = [s["onset"] for s in stream]
+        stream_end = stream[-1]["end"] if stream else 0.0
+        lookback = int(np.ceil((window + late_win) / min_soa(p))) + 1
 
         events_log = []
         event_counter = [0]
@@ -430,6 +581,8 @@ try:
             ev["onset_s"] = f'{s["onset"]:.4f}'
             ev["symbol"] = s["symbol"]
             ev["nback_symbol"] = s["nback_symbol"]
+            ev["isi_before_s"] = fmt_s(s["isi_before"])
+            ev["retention_s"] = fmt_s(s["retention"])
             return ev
 
         n_hits = n_fa = n_dup = n_other = n_late = 0
@@ -439,30 +592,35 @@ try:
 
         kb.clearEvents()
         win.frameIntervals = []
-        # Symbol onsets and key presses are both timed on the keyboard's clock,
-        # so a press's rt is directly comparable with the stream schedule.
         clock = kb.clock
         clock.reset()
         seen_presses = set()
+
+        def guarded(fn):
+            try:
+                return fn()
+            except AttributeError as e:
+                if not is_pyglet_mac_glitch(e):
+                    raise
+                ev = blank_event("Input Error")
+                ev["press_time_s"] = f"{clock.getTime():.4f}"
+                emit(ev)
+                return []
         completed = False
         last_drawn = None
         loaded_symbol = None
 
         try:
-            # Driven by elapsed time rather than frame count, so the schedule
-            # cannot drift.
             while clock.getTime() < duration:
                 n_frames += 1
                 t = clock.getTime()
-                i = int(t // soa)
-                if i >= n_pres:
+                if t >= stream_end:
                     break
-                showing = (t - i * soa) < sdur
+                i = bisect.bisect_right(onsets, t) - 1
                 cur = stream[i]
+                showing = (t - cur["onset"]) < sdur
 
                 if showing:
-                    # Re-rendering text every frame can drop frames; only
-                    # update it when the symbol changes.
                     if loaded_symbol != cur["symbol"]:
                         sym_stim.text = cur["symbol"]
                         loaded_symbol = cur["symbol"]
@@ -472,12 +630,10 @@ try:
                         mask_stim.draw()
                     if p["show_placeholder"]:
                         dot_stim.draw()
-                win.flip()
+                guarded(win.flip)
 
-                keys = kb.getKeys(waitRelease=False)
+                keys = guarded(lambda: kb.getKeys(waitRelease=False))
                 for k in keys:
-                    # Count each physical press once, even if the keyboard
-                    # reports it on more than one frame.
                     press_id = (k.name, getattr(k, "tDown", None))
                     if press_id[1] is not None:
                         if press_id in seen_presses:
@@ -493,21 +649,17 @@ try:
                         emit(ev)
                         continue
 
-                    # rt is the press time on the keyboard clock, i.e. stream
-                    # time. Fall back to the current time if it is unusable.
                     t_now = clock.getTime()
                     t_press = getattr(k, "rt", None)
                     if t_press is not None and np.isfinite(t_press) and t_press < 0:
-                        continue      # began before the stream, e.g. the start key
+                        continue
                     if (t_press is None or not np.isfinite(t_press)
                             or t_press > t_now + 0.001):
                         t_press = t_now
 
-                    # A press within a target's response window is a hit. If no
-                    # window is open, a press shortly after one closed belongs
-                    # to that target as a late response. Only presses with
-                    # neither are false alarms.
-                    j = int(t_press // soa)
+                    # Hit if inside a target's response window; otherwise late if just
+                    # after one; otherwise a false alarm.
+                    j = bisect.bisect_right(onsets, t_press) - 1
                     hit_on = late_on = None
                     for cand in range(j, max(-1, j - lookback - 1), -1):
                         if cand < 0 or cand >= n_pres:
@@ -547,8 +699,7 @@ try:
                         ev["rt_ms"] = f"{rt:.1f}"
                         ev["late_response"] = 1
                         ev["attributed_to_presentation"] = late_on["idx"]
-                        ev["presentations_after_target"] = int(
-                            (t_press - late_on["onset"]) // soa)
+                        ev["presentations_after_target"] = j - late_on["idx"]
                         emit(ev)
                     else:
                         hit_on["responded"] = True
@@ -562,8 +713,7 @@ try:
                         ev["rt_ms"] = f"{rt:.1f}"
                         ev["responded"] = 1
                         ev["attributed_to_presentation"] = hit_on["idx"]
-                        ev["presentations_after_target"] = int(
-                            (t_press - hit_on["onset"]) // soa)
+                        ev["presentations_after_target"] = j - hit_on["idx"]
                         emit(ev)
 
                 last_drawn = i
@@ -587,9 +737,6 @@ try:
                     ev["late_response"] = int(s["late_rt"] is not None)
                     emit(ev)
 
-            # Time in which a press would have counted as a false alarm: the
-            # run minus every target's hit and late windows (merged where
-            # they overlap).
             covered, reach = 0.0, 0.0
             for s in stream[:shown]:
                 if s["is_target"]:
@@ -641,19 +788,31 @@ try:
 
     def show_text(win, text, body, wait_key=True, secs=None):
         text.text = body
-        text.draw()
-        win.flip()
+        for attempt in range(3):
+            try:
+                text.draw()
+                win.flip()
+                break
+            except AttributeError as e:
+                if not is_pyglet_mac_glitch(e):
+                    raise
         if wait_key:
-            keys = event.waitKeys()
+            while True:
+                try:
+                    keys = event.waitKeys()
+                    break
+                except AttributeError as e:
+                    if not is_pyglet_mac_glitch(e):
+                        raise
             if keys and "escape" in keys:
                 raise AbortExperiment()
         elif secs:
             core.wait(secs)
 
 
-    # ------------------------------------------------------------------ #
-
+    # ---- Main ----
     def main():
+        resolve_timing(P)
         bad = check_params(P)
         if bad:
             print("\n--- PARAMETERS REJECTED ---")
@@ -679,10 +838,19 @@ try:
 
         kb = keyboard.Keyboard()
         event.globalKeys.clear()
+        P["keyboard_backend"] = str(getattr(keyboard.Keyboard, "_backend", ""))
+        P["macos_pyglet_fix"] = PYGLET_MAC_FIX
+        if P["keyboard_backend"] == "event":
+            print("[psychtoolbox is not installed, so key presses are only timed "
+                  "to the nearest screen refresh. Install it with: "
+                  "pip install psychtoolbox]")
 
         measured = win.getActualFrameRate(nIdentical=20, nMaxFrames=100,
                                           nWarmUpFrames=10, threshold=1)
         P["frmrate_measured"] = measured if measured else P["frmrate_expected"]
+        resolve_timing(P)          # re-snap durations to the measured refresh rate
+        print("[timing at the measured refresh rate]")
+        print_timing(P)
         win.recordFrameIntervals = True
         win.refreshThreshold = (1.0 / P["frmrate_measured"]) + 0.004
 
@@ -725,22 +893,23 @@ try:
                     if practice_done >= n_practice_total:
                         continue
                     practice_done += 1
-                n_pres = int(duration // soa_of(P))
-                stream = build_sequence(prng, n_pres, P)
+                label = f"practice{practice_done}" if phase == "practice" else phase
+                stream = build_sequence(prng, duration, P)
                 problems = validate_sequence(stream, P)
                 if problems:
                     print("--- SEQUENCE WARNINGS ---")
                     for x in problems:
                         print("   ", x)
-                write_stream_record(subj, run_id, phase, stream)
+                write_stream_record(subj, run_id, label, stream)
 
                 if phase == "practice":
                     show_text(win, text,
-                              "Practice: about 45 seconds.\n\n"
+                              f"Practice: about {duration_text(P['practice_duration'])}.\n\n"
                               "Press any key to start.")
                 else:
                     show_text(win, text,
-                              "Now the main task: 5 minutes without a break.\n\n"
+                              f"Now the main task: {duration_text(P['stream_duration'])} "
+                              "without a break.\n\n"
                               "Press any key to start.")
 
                 def log_event(ev, _phase=phase):
@@ -753,13 +922,13 @@ try:
 
                 result = {}
                 try:
-                    run_stream(win, kb, stim, P, stream, duration, phase,
+                    run_stream(win, kb, stim, P, stream, duration, label,
                                log_event, out=result)
                 finally:
                     if result:
                         bk_writer.writerow([
                             datetime.now().isoformat(timespec="milliseconds"),
-                            run_id, subj, int(phase == "practice"), seed, phase,
+                            run_id, subj, int(phase == "practice"), seed, label,
                             f'{result["elapsed"]:.3f}', result["n_presentations"],
                             result["n_frames"], result["n_targets"],
                             result["n_hits"], result["n_misses"], result["n_late"],
