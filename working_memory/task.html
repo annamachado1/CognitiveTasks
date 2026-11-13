@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repeat detection task</title>
+<link rel="icon" href="data:,">
+<!--
+  Browser version of working_memory/vwm_repeat_detection_task.py.
+  Same parameters, sequence rules (truncated-normal ISIs, geometric target
+  spacing, no-repeat window), scoring (hit / late / false alarm / duplicate),
+  practice-with-retry logic and output columns. Served by server.py, which
+  writes the data to data/<subject>/ exactly as the PsychoPy script does.
+
+  Differences from the PsychoPy version:
+  - Sizes are set in degrees of visual angle, using a credit-card screen
+    calibration and the viewing distance entered at the start.
+  - Sequences come from a seeded JavaScript RNG, so subject N gets a
+    different (but reproducible) sequence than in PsychoPy.
+  - Leaving full screen during a stream ends the task, like Escape in PsychoPy.
+  - Two extra event types: "Focus Lost" / "Focus Regained" (another window or
+    tab took focus mid-stream).
+-->
+<style>
+  :root {
+    --task-grey: #a0a0a0;   /* bkgd_col (160,160,160) */
+    --ink: #000;
+    --field: #d4d4d4;
+    --rule: #5a5a5a;
+    --warn: #5c1a00;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--task-grey); color: var(--ink); }
+  body { font: 17px/1.5 Arial, Helvetica, sans-serif; }
+
+  #setup { max-width: 36rem; padding: 3rem 1.5rem 4rem; }
+  h1 { font-size: 1.75rem; line-height: 1.2; margin: 0 0 .5rem; font-weight: bold; }
+  h2 { font-size: 1.1rem; margin: 2.25rem 0 .5rem; }
+  p { margin: 0 0 .75rem; }
+  .lede { margin-bottom: 1.75rem; }
+  label.row { display: block; margin: 1rem 0 0; }
+  label.row span { display: block; font-weight: bold; margin-bottom: .25rem; }
+  input[type=number] {
+    font: inherit; width: 9rem; padding: .4rem .5rem;
+    background: var(--field); border: 1px solid var(--rule); border-radius: 3px; color: var(--ink);
+  }
+  label.check { display: flex; gap: .5rem; align-items: center; margin-top: 1rem; }
+  input[type=checkbox] { width: 1.1rem; height: 1.1rem; accent-color: #000; }
+  .hint { font-size: .9rem; margin-top: .25rem; }
+  input:focus-visible, button:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+
+  #cardBox { margin: 1rem 0 .75rem; overflow: hidden; }
+  #card {
+    border: 2px solid var(--ink); background: #b9b9b9;
+  }
+  input[type=range] { width: 100%; accent-color: #000; }
+
+  button.go {
+    font: inherit; font-weight: bold; margin-top: 2rem; padding: .7rem 1.4rem;
+    background: var(--ink); color: #fff; border: 0; border-radius: 3px; cursor: pointer;
+  }
+  button.go:disabled { opacity: .45; cursor: not-allowed; }
+  .problem { color: var(--warn); font-weight: bold; }
+
+  #stage { position: fixed; inset: 0; display: none; background: var(--task-grey); cursor: none; }
+  #stage.on { display: block; }
+  #screen { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #msg {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; white-space: pre-line; font-size: 24px; line-height: 1.35; padding: 2rem;
+  }
+  #msg[hidden] { display: none; }
+
+  #done { max-width: 36rem; padding: 3rem 1.5rem; display: none; }
+  #done.on { display: block; }
+  #downloads a { display: block; color: var(--ink); margin: .3rem 0; }
+</style>
+</head>
+<body>
+
+<main id="setup">
+  <h1>Repeat detection task</h1>
+  <p class="lede">Letters and numbers appear one at a time. You press the spacebar when a symbol matches the one two before it. It takes about 17 minutes, runs full screen and needs a physical keyboard.</p>
+
+  <p id="keyProblem" class="problem" hidden>This link is missing its access key, so your data can’t be sent to the experimenter. Ask them for the full link. You can still run the task and download your data at the end.</p>
+  <p id="paramProblem" class="problem" hidden></p>
+
+  <label class="row"><span>Subject number</span>
+    <input id="subj" type="number" min="0" max="999999" step="1" value="1"></label>
+
+  <label class="check"><input id="practice" type="checkbox" checked> Run practice first</label>
+
+  <label class="row"><span>Viewing distance (cm)</span>
+    <input id="dist" type="number" min="20" max="200" step="1" value="57"></label>
+  <p class="hint">Sit at a comfortable arm’s length; about 57 cm is typical. Try to keep the same distance throughout.</p>
+
+  <h2>Match your screen size</h2>
+  <p>Hold a bank card (or any card the same size as one) flat against the screen and drag the slider until the outline is exactly the size of the card.</p>
+  <div id="cardBox"><div id="card"></div></div>
+  <input id="cardSlider" type="range" min="120" max="900" step="1" value="323" aria-label="Card outline width">
+
+  <button id="start" class="go">Start the task</button>
+</main>
+
+<div id="stage">
+  <canvas id="screen"></canvas>
+  <div id="msg" hidden></div>
+</div>
+
+<main id="done">
+  <h1 id="doneTitle">Task finished</h1>
+  <p id="doneText"></p>
+  <div id="downloads"></div>
+</main>
+
+<script>
+"use strict";
+
+// ---- Parameters (same names and values as the PsychoPy script) ----
+const P = {
+  symbol_dur: 0.25,
+  symbol_round_to_frames: true,
+  isi_mean: 2.0,
+  isi_sd: 0.3,
+  isi_trunc_sd: 1.0,
+  isi_min: null,
+  isi_max: null,
+  isi_round_to_frames: true,
+  stream_duration: 900.0,
+  practice_duration: 45.0,
+  run_practice: true,
+  practice_max_runs: 2,
+  practice_pass_hit_rate: 0.5,
+
+  response_key: "space",
+  response_window: 1.5,
+  late_response_window: 1.0,
+
+  target_lag: 2,
+  targets_per_min: 15.0,
+  target_rate_mode: "per_presentation",
+  min_repeat_gap: 10,
+  min_event_gap_s: 2.0,
+  first_event_min_s: 6.0,
+  symbols: "ACDEFHJKMNPRTUVWXY3479",
+
+  // Display. Sizes are in degrees of visual angle. These reproduce the lab
+  // laptop's 200 px symbol, 5 px placeholder and 84 px mask under the geometry
+  // in its params files (3024 px across 52 cm, viewed from 57 cm).
+  symbol_height_deg: 3.456,
+  symbol_font: "Arial, Helvetica, sans-serif",
+  symbol_col: [0, 0, 0],
+  bkgd_col: [160, 160, 160],
+  show_placeholder: true,
+  placeholder_radius_deg: 0.0864,
+  placeholder_col: [90, 90, 90],
+  use_mask: false,
+  mask_radius_deg: 1.452,
+  mask_col: [140, 140, 140],
+
+  frmrate_expected: 60,
+  practice_seed_offset: 100000,
+};
+
+const EVENT_FIELDS = [
+  "datetime", "run_id", "subject", "practice", "seed", "phase",
+  "event_num", "event_type",
+  "presentation_num", "onset_s", "symbol", "nback_symbol",
+  "isi_before_s", "retention_s",
+  "key_name", "press_time_s", "rt_ms", "responded", "late_response",
+  "attributed_to_presentation", "presentations_after_target",
+];
+const BLOCK_FIELDS = [
+  "datetime", "run_id", "subject", "practice", "seed", "phase",
+  "stream_duration_s", "n_presentations", "n_frames",
+  "n_targets", "n_hits", "n_misses", "n_late_responses",
+  "n_false_alarms", "n_duplicate_presses", "n_other_keys",
+  "hit_rate", "mean_rt_ms", "median_rt_ms", "mean_late_rt_ms",
+  "hit_rate_h1", "hit_rate_h2", "mean_rt_h1_ms", "mean_rt_h2_ms",
+  "fa_per_min", "time_at_risk_s",
+  "frmrate_measured", "n_dropped_frames", "completed",
+];
+const SEQUENCE_FIELDS = [
+  "presentation_num", "onset_s", "symbol", "is_target", "nback_symbol",
+  "repeat_lag", "isi_before_s", "isi_after_s", "retention_s",
+];
+const TASK_VERSION = "web-1.0";
+const KEY = new URLSearchParams(location.search).get("key") || "";
+const CAN_SAVE = KEY !== "" && location.protocol.startsWith("http");
+
+class AbortExperiment extends Error {
+  constructor(reason) { super(reason); this.reason = reason; }
+}
+
+// ---- Small helpers ----
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const f4 = x => (x === null || x === undefined) ? "" : x.toFixed(4);
+const fmtOr = (x, d) => (x === "" || x === null || x === undefined) ? "" : Number(x).toFixed(d);
+const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+function median(a) {
+  const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function localIso(d = new Date()) {
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+const rgb = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+function bisectRight(a, x) { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (x < a[m]) hi = m; else lo = m + 1; } return lo; }
+function bisectLeft(a, x) { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m] < x) lo = m + 1; else hi = m; } return lo; }
+function randomHex8() { const b = new Uint8Array(4); crypto.getRandomValues(b); return [...b].map(x => x.toString(16).padStart(2, "0")).join(""); }
+
+// Seeded RNG (splitmix32) with the draws the sequence builder needs.
+function makeRng(seed) {
+  let a = (seed ^ 0x9E3779B9) >>> 0;
+  const next = () => {
+    a = (a + 0x9E3779B9) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 16), 0x21F0AAAD);
+    t = Math.imul(t ^ (t >>> 15), 0x735A2D97);
+    t ^= t >>> 15;
+    return (t >>> 0) / 4294967296;
+  };
+  return {
+    random: next,
+    integers: n => Math.floor(next() * n),          // 0 .. n-1
+    normal(mu, sd) {
+      const u1 = next() || 1e-12, u2 = next();
+      return mu + sd * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    },
+    geometric(p) {                                    // trials to first success, >= 1
+      if (p >= 1) return 1;
+      return Math.max(1, Math.ceil(Math.log(1 - next()) / Math.log(1 - p)));
+    },
+  };
+}
+
+// ---- Timing and parameter checks (ported) ----
+const soaOf = p => p.symbol_dur + p.isi_mean;
+const minSoa = p => p.symbol_dur + p.isi_min;
+const maxSoa = p => p.symbol_dur + p.isi_max;
+const retentionInterval = p => p.target_lag * soaOf(p);
+const noRepeatWindow = p => Math.max(p.min_repeat_gap, p.target_lag);
+const minGapPresentations = p => {
+  const soa = minSoa(p);
+  return Math.max(p.target_lag + 1, Math.ceil(p.min_event_gap_s / soa), Math.ceil(p.response_window / soa));
+};
+const frameDur = p => 1 / (p.frmrate_measured || p.frmrate_expected);
+
+function resolveTiming(p) {
+  if (p.isi_trunc_sd !== null) {
+    p.isi_min = p.isi_mean - p.isi_trunc_sd * p.isi_sd;
+    p.isi_max = p.isi_mean + p.isi_trunc_sd * p.isi_sd;
+  }
+  if (p.symbol_dur_requested === undefined) p.symbol_dur_requested = p.symbol_dur;
+  const req = p.symbol_dur_requested;
+  if (p.symbol_round_to_frames && req > 0) {
+    const fd = frameDur(p);
+    p.symbol_dur = Math.max(1, Math.round(req / fd)) * fd;
+  } else {
+    p.symbol_dur = req;
+  }
+}
+
+function checkParams(p) {
+  const problems = [];
+  if (p.symbol_dur <= 0) problems.push("symbol_dur must be positive");
+  if (p.isi_sd < 0) problems.push("isi_sd cannot be negative");
+  if (p.isi_trunc_sd !== null && p.isi_trunc_sd < 0) problems.push("isi_trunc_sd cannot be negative");
+  if (p.isi_min === null || p.isi_max === null) problems.push("set isi_trunc_sd, or set both isi_min and isi_max");
+  else if (!(0 < p.isi_min && p.isi_min <= p.isi_mean && p.isi_mean <= p.isi_max))
+    problems.push(`ISI limits ${p.isi_min.toFixed(3)}-${p.isi_max.toFixed(3)}s must satisfy 0 < isi_min <= isi_mean <= isi_max`);
+  if (p.response_window <= 0) problems.push("response_window must be positive");
+  if (p.late_response_window < 0) problems.push("late_response_window cannot be negative");
+  if (p.target_lag < 1) problems.push("target_lag must be 1 or more");
+  const nSym = new Set(p.symbols).size;
+  if (noRepeatWindow(p) >= nSym)
+    problems.push(`each symbol must differ from the previous ${noRepeatWindow(p)}, but the pool only has ${nSym} distinct symbols`);
+  return problems;
+}
+
+function timingSummary(p) {
+  const soa = soaOf(p), lag = p.target_lag, w = p.response_window;
+  return {
+    symbol_dur: p.symbol_dur, isi_mean: p.isi_mean, isi_sd: p.isi_sd,
+    isi_min: p.isi_min, isi_max: p.isi_max,
+    soa_mean: soa, soa_min: minSoa(p), soa_max: maxSoa(p),
+    target_lag: lag,
+    retention_interval_mean: retentionInterval(p),
+    retention_interval_min: lag * minSoa(p),
+    retention_interval_max: lag * maxSoa(p),
+    min_repeat_gap: p.min_repeat_gap,
+    symbols_per_min: 60 / soa,
+    response_window: w,
+    late_response_window: p.late_response_window,
+    window_past_next_symbol: w - minSoa(p),
+    min_target_spacing: minGapPresentations(p) * minSoa(p),
+    n_presentations_approx: Math.floor(p.stream_duration / soa),
+  };
+}
+
+function ruleText(p) {
+  if (p.target_lag === 1) return "the same as the one just before it";
+  if (p.target_lag === 2) return "the same as the one TWO before it";
+  return `the same as the one ${p.target_lag} before it`;
+}
+function durationText(secs) {
+  if (secs < 60) return `${secs} seconds`;
+  const m = secs / 60;
+  return `${m} minute` + (m === 1 ? "" : "s");
+}
+
+// ---- Sequence construction (ported) ----
+function drawIsis(rng, n, p) {
+  const mu = p.isi_mean, sd = p.isi_sd, lo = p.isi_min, hi = p.isi_max;
+  let isis = new Array(n);
+  for (let k = 0; k < n; k++) {
+    if (sd <= 0 || hi <= lo) { isis[k] = mu; continue; }
+    let x;
+    do { x = rng.normal(mu, sd); } while (x < lo || x > hi);
+    isis[k] = x;
+  }
+  if (p.isi_round_to_frames) {
+    const fd = frameDur(p);
+    const fLo = Math.ceil(lo / fd - 1e-6), fHi = Math.floor(hi / fd + 1e-6);
+    isis = isis.map(x => {
+      let fr = Math.round(x / fd);
+      if (fLo <= fHi) fr = Math.min(Math.max(fr, fLo), fHi);
+      return fr * fd;
+    });
+  }
+  return isis;
+}
+
+function buildSequence(rng, duration, p) {
+  const sdur = p.symbol_dur, lag = p.target_lag;
+  const minGap = minGapPresentations(p), noRepeat = noRepeatWindow(p);
+
+  const nMax = Math.ceil(duration / minSoa(p)) + 1;
+  let isis = drawIsis(rng, nMax, p);
+  let onsets = [], ends = [], acc = 0;
+  for (let k = 0; k < nMax; k++) { onsets.push(acc); acc += sdur + isis[k]; ends.push(acc); }
+  let nPres = 0;
+  while (nPres < nMax && ends[nPres] <= duration + 1e-9) nPres++;
+  onsets = onsets.slice(0, nPres); ends = ends.slice(0, nPres); isis = isis.slice(0, nPres);
+  const streamEnd = nPres ? ends[nPres - 1] : 0;
+
+  const firstOk = Math.max(lag, bisectLeft(onsets, p.first_event_min_s - 1e-9));
+  const lastOk = bisectRight(onsets, streamEnd - (p.response_window + p.late_response_window) + 1e-9) - 1;
+
+  let nTargets = p.target_rate_mode === "per_presentation"
+    ? Math.round(p.targets_per_min / 60 * nPres)
+    : Math.round(p.targets_per_min * streamEnd / 60);
+
+  const span = lastOk + 1 - firstOk;
+  if (span <= 0) nTargets = 0;
+  else if (nTargets > 0 && Math.floor(span / minGap) < nTargets) nTargets = Math.max(0, Math.floor(span / minGap) - 1);
+
+  const meanGap = nTargets ? span / nTargets : span;
+  const extra = Math.max(0, meanGap - minGap);
+  const pGeom = extra > 0 ? 1 / (1 + extra) : 1;
+
+  // Geometric gaps above minGap give a flat hazard, so targets can't be anticipated.
+  const slots = new Set();
+  let i = firstOk + rng.integers(minGap + 1);
+  while (i <= lastOk && slots.size < nTargets) {
+    slots.add(i);
+    i += minGap + rng.geometric(pGeom) - 1;
+  }
+
+  const syms = [...new Set(p.symbols)];
+  const seqSym = new Array(nPres).fill(null);
+  for (let k = 0; k < nPres; k++) {
+    if (slots.has(k)) seqSym[k] = seqSym[k - lag];
+    else {
+      const banned = new Set(seqSym.slice(Math.max(0, k - noRepeat), k));
+      const choices = syms.filter(s => !banned.has(s));
+      seqSym[k] = choices[rng.integers(choices.length)];
+    }
+  }
+
+  const lastSeen = {}, repeatLag = new Array(nPres).fill(0);
+  seqSym.forEach((s, k) => { if (s in lastSeen) repeatLag[k] = k - lastSeen[s]; lastSeen[s] = k; });
+
+  const stream = [];
+  for (let k = 0; k < nPres; k++) {
+    const nback = k >= lag ? seqSym[k - lag] : "";
+    stream.push({
+      idx: k, onset: onsets[k], end: ends[k], isi_after: isis[k],
+      isi_before: k > 0 ? isis[k - 1] : null,
+      retention: k >= lag ? onsets[k] - onsets[k - lag] : null,
+      symbol: seqSym[k], is_target: k >= lag && seqSym[k] === nback,
+      nback_symbol: nback, repeat_lag: repeatLag[k],
+      responded: false, rt: null, late_rt: null,
+    });
+  }
+  return stream;
+}
+
+function validateSequence(stream, p) {
+  const problems = [], lag = p.target_lag;
+  const minGap = minGapPresentations(p), noRepeat = noRepeatWindow(p);
+  const minSpacing = Math.max(p.min_event_gap_s, p.response_window);
+  const targets = stream.filter(s => s.is_target).map(s => s.idx);
+  for (let k = 1; k < targets.length; k++) {
+    const a = targets[k - 1], b = targets[k];
+    if (b - a < minGap) problems.push(`targets ${a} and ${b} are only ${b - a} apart`);
+    const gap = stream[b].onset - stream[a].onset;
+    if (gap < minSpacing - 1e-9) problems.push(`targets ${a} and ${b} are only ${gap.toFixed(2)}s apart`);
+  }
+  if (targets.length && stream[targets[0]].onset < p.first_event_min_s - 1e-9)
+    problems.push(`first target at ${stream[targets[0]].onset.toFixed(1)}s`);
+  const end = stream.length ? stream[stream.length - 1].end : 0;
+  if (targets.length && stream[targets.at(-1)].onset + p.response_window + p.late_response_window > end + 1e-9)
+    problems.push("last target cannot be fully answered before the stream ends");
+  for (const s of stream) {
+    if (!(p.isi_min - 1e-6 <= s.isi_after && s.isi_after <= p.isi_max + 1e-6))
+      problems.push(`presentation ${s.idx} has an ISI outside the limits`);
+    if (s.is_target) { if (s.repeat_lag !== lag) problems.push(`target ${s.idx} repeats at lag ${s.repeat_lag}`); }
+    else if (s.repeat_lag > 0 && s.repeat_lag <= noRepeat) problems.push(`presentation ${s.idx} repeats too soon`);
+  }
+  return problems;
+}
+
+// ---- Saving ----
+const Backup = { events: [], blocks: [], sequences: {}, params: null, subject: null, runId: null };
+const Saver = {
+  queue: [], busy: false, failed: false, pendingEvents: [],
+  send(msg) { this.queue.push(msg); this.pump(); },
+  async pump() {
+    if (this.busy || !CAN_SAVE) return;
+    this.busy = true;
+    while (this.queue.length) {
+      const msg = this.queue[0];
+      let ok = false;
+      for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+        try {
+          const r = await fetch("/api/save", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...msg, key: KEY }),
+          });
+          if (r.ok) ok = true;
+          else if (r.status === 400 || r.status === 403 || r.status === 413) {
+            console.error("Save rejected:", r.status, await r.text());
+            break;
+          }
+        } catch (e) { /* network hiccup: retry */ }
+        if (!ok) await sleep(1000 * (attempt + 1));
+      }
+      if (!ok) this.failed = true;
+      this.queue.shift();
+    }
+    this.busy = false;
+  },
+  flushEvents(base) {
+    if (!this.pendingEvents.length) return;
+    this.send({ ...base, kind: "events", rows: this.pendingEvents.splice(0) });
+  },
+  async drain(timeoutMs = 20000) {
+    const t = performance.now();
+    while ((this.busy || this.queue.length) && performance.now() - t < timeoutMs) await sleep(100);
+    return !(this.busy || this.queue.length) && !this.failed && CAN_SAVE;
+  },
+};
+
+// ---- Display ----
+const stage = document.getElementById("stage");
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const msgEl = document.getElementById("msg");
+let W = 0, H = 0, pxPerCm = 323 / 8.56, distCm = 57;
+let symbolPx = 0, dotPx = 0, maskPx = 0;
+
+function degToPx(deg) { return 2 * distCm * Math.tan(deg * Math.PI / 360) * pxPerCm; }
+function sizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", () => { if (stage.classList.contains("on")) { sizeCanvas(); paint(currentPaint); } });
+
+let currentPaint = { mode: "blank" };
+function paint(state) {
+  currentPaint = state;
+  ctx.fillStyle = rgb(P.bkgd_col);
+  ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  if (state.mode === "symbol") {
+    ctx.fillStyle = rgb(P.symbol_col);
+    ctx.font = `${symbolPx}px ${P.symbol_font}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(state.symbol, cx, cy);
+  } else if (state.mode === "isi") {
+    if (P.use_mask) { ctx.fillStyle = rgb(P.mask_col); ctx.beginPath(); ctx.arc(cx, cy, maskPx, 0, 2 * Math.PI); ctx.fill(); }
+    if (P.show_placeholder) { ctx.fillStyle = rgb(P.placeholder_col); ctx.beginPath(); ctx.arc(cx, cy, dotPx, 0, 2 * Math.PI); ctx.fill(); }
+  }
+}
+
+// ---- Full screen ----
+const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+function requestFs() {
+  const el = document.documentElement;
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!fn) return Promise.resolve();
+  try { return Promise.resolve(fn.call(el)).catch(() => {}); } catch (e) { return Promise.resolve(); }
+}
+function exitFs() {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen;
+  if (fn && fsElement()) { try { Promise.resolve(fn.call(document)).catch(() => {}); } catch (e) {} }
+}
+let onFsChange = null;
+["fullscreenchange", "webkitfullscreenchange"].forEach(t =>
+  document.addEventListener(t, () => { if (onFsChange) onFsChange(); }));
+
+// ---- Keys ----
+const KEY_NAMES = { " ": "space", "Enter": "return", "Escape": "escape", "Backspace": "backspace",
+  "Tab": "tab", "ArrowUp": "up", "ArrowDown": "down", "ArrowLeft": "left", "ArrowRight": "right" };
+function keyName(e) {
+  if (e.key in KEY_NAMES) return KEY_NAMES[e.key];
+  if (e.code === "ShiftLeft") return "lshift";
+  if (e.code === "ShiftRight") return "rshift";
+  return (e.key || "").toLowerCase();
+}
+
+function showText(body) {
+  return new Promise((resolve, reject) => {
+    paint({ mode: "blank" });
+    msgEl.textContent = body;
+    msgEl.hidden = false;
+    const shownAt = performance.now();
+    function onKey(e) {
+      if (e.repeat) return;
+      e.preventDefault();
+      if (performance.now() - shownAt < 400) return;   // ignore presses carried over from a stream
+      window.removeEventListener("keydown", onKey);
+      msgEl.hidden = true;
+      if (e.key === "Escape") { reject(new AbortExperiment("escape")); return; }
+      if (!fsElement()) requestFs();
+      resolve();
+    }
+    window.addEventListener("keydown", onKey);
+  });
+}
+
+// ---- Refresh rate ----
+function measureRefresh(nWarm = 10, nFrames = 120) {
+  return new Promise(resolve => {
+    const ts = [];
+    function tick(t) {
+      ts.push(t);
+      if (ts.length < nWarm + nFrames) requestAnimationFrame(tick);
+      else {
+        const iv = [];
+        for (let k = nWarm + 1; k < ts.length; k++) iv.push(ts[k] - ts[k - 1]);
+        const med = median(iv);
+        resolve(med > 4 && med < 50 ? 1000 / med : null);
+      }
+    }
+    requestAnimationFrame(tick);
+  });
+}
+
+// ---- Stream (ported run_stream) ----
+function runStream(stream, duration, phase, logEvent, flushBase) {
+  return new Promise(resolve => {
+    const sdur = P.symbol_dur, win = P.response_window, lateWin = P.late_response_window;
+    const nPres = stream.length;
+    const onsets = stream.map(s => s.onset);
+    const streamEnd = nPres ? stream[nPres - 1].end : 0;
+    const lookback = Math.ceil((win + lateWin) / minSoa(P)) + 1;
+    const fd = frameDur(P);
+    const wasFullscreen = !!fsElement();
+
+    const eventsLog = [];
+    let eventNum = 0;
+    const emit = ev => {
+      eventNum += 1;
+      ev.event_num = eventNum; ev.phase = phase; ev.datetime = localIso();
+      logEvent(ev); eventsLog.push(ev);
+    };
+    const blankEvent = type => { const ev = {}; EVENT_FIELDS.forEach(k => ev[k] = ""); ev.event_type = type; return ev; };
+    const presentationRow = (s, type) => {
+      const ev = blankEvent(type);
+      ev.presentation_num = s.idx; ev.onset_s = s.onset.toFixed(4); ev.symbol = s.symbol;
+      ev.nback_symbol = s.nback_symbol; ev.isi_before_s = f4(s.isi_before); ev.retention_s = f4(s.retention);
+      return ev;
+    };
+
+    let nHits = 0, nFa = 0, nDup = 0, nOther = 0, nLate = 0, nFrames = 0;
+    const rts = [], lateRts = [], frameIntervals = [];
+    let t0 = null, lastTs = null, lastDrawn = null, drawnKey = null, lastFlush = 0;
+    let finished = false;
+
+    const clockNow = () => t0 === null ? 0 : (performance.now() - t0) / 1000;
+
+    function onKey(e) {
+      if (finished || e.repeat) return;
+      if (e.key === " ") e.preventDefault();
+      if (t0 === null) return;
+      if (e.key === "Escape") { e.preventDefault(); finish(false, "escape"); return; }
+      const tNow = clockNow();
+      let tPress = (Number.isFinite(e.timeStamp) && e.timeStamp < 1e11) ? (e.timeStamp - t0) / 1000 : tNow;
+      const name = keyName(e);
+      if (name !== P.response_key) {
+        nOther += 1;
+        const ev = blankEvent("Other Key"); ev.key_name = name; ev.press_time_s = tPress.toFixed(4);
+        emit(ev); return;
+      }
+      if (tPress < 0) return;
+      if (tPress > tNow + 0.001) tPress = tNow;
+
+      // Hit if inside a target's response window; otherwise late if just after one; otherwise a false alarm.
+      const j = bisectRight(onsets, tPress) - 1;
+      let hitOn = null, lateOn = null;
+      for (let c = j; c > Math.max(-1, j - lookback - 1); c--) {
+        if (c < 0 || c >= nPres) continue;
+        const s = stream[c];
+        if (!s.is_target) continue;
+        const dt = tPress - s.onset;
+        if (dt >= 0 && dt <= win) { hitOn = s; break; }
+        if (lateOn === null && dt > win && dt <= win + lateWin) lateOn = s;
+      }
+      const owner = hitOn || lateOn;
+      if (owner === null) {
+        nFa += 1;
+        const ev = blankEvent("False Alarm"); ev.key_name = P.response_key; ev.press_time_s = tPress.toFixed(4);
+        emit(ev);
+      } else if (owner.responded || owner.late_rt !== null) {
+        nDup += 1;
+        const ev = blankEvent("Duplicate Press"); ev.key_name = P.response_key; ev.press_time_s = tPress.toFixed(4);
+        ev.attributed_to_presentation = owner.idx;
+        emit(ev);
+      } else if (hitOn === null) {
+        const rt = (tPress - lateOn.onset) * 1000;
+        lateOn.late_rt = rt; lateRts.push(rt); nLate += 1;
+        const ev = presentationRow(lateOn, "Late Response");
+        ev.key_name = P.response_key; ev.press_time_s = tPress.toFixed(4); ev.rt_ms = rt.toFixed(1);
+        ev.late_response = 1; ev.attributed_to_presentation = lateOn.idx; ev.presentations_after_target = j - lateOn.idx;
+        emit(ev);
+      } else {
+        hitOn.responded = true;
+        const rt = (tPress - hitOn.onset) * 1000;
+        hitOn.rt = rt; rts.push(rt); nHits += 1;
+        const ev = presentationRow(hitOn, "Hit");
+        ev.key_name = P.response_key; ev.press_time_s = tPress.toFixed(4); ev.rt_ms = rt.toFixed(1);
+        ev.responded = 1; ev.attributed_to_presentation = hitOn.idx; ev.presentations_after_target = j - hitOn.idx;
+        emit(ev);
+      }
+    }
+    function onBlur() { if (!finished && t0 !== null) { const ev = blankEvent("Focus Lost"); ev.press_time_s = clockNow().toFixed(4); emit(ev); } }
+    function onFocus() { if (!finished && t0 !== null) { const ev = blankEvent("Focus Regained"); ev.press_time_s = clockNow().toFixed(4); emit(ev); } }
+
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    onFsChange = () => { if (wasFullscreen && !fsElement()) finish(false, "left full screen"); };
+
+    function frame(ts) {
+      if (finished) return;
+      if (t0 === null) t0 = ts; else frameIntervals.push((ts - lastTs) / 1000);
+      lastTs = ts;
+      nFrames += 1;
+      const t = (ts - t0) / 1000;
+      if (t >= duration || t >= streamEnd) { finish(true); return; }
+      const tc = t + fd / 2;                        // decide at mid-frame, robust to timestamp jitter
+      const i = Math.max(0, bisectRight(onsets, tc) - 1);
+      const cur = stream[i];
+      const showing = (tc - cur.onset) < sdur;
+      const key = showing ? "s" + i : "b" + i;
+      if (key !== drawnKey) { paint(showing ? { mode: "symbol", symbol: cur.symbol } : { mode: "isi" }); drawnKey = key; }
+      lastDrawn = i;
+      if (!showing && t - lastFlush > 10) { lastFlush = t; Saver.flushEvents(flushBase); }
+      requestAnimationFrame(frame);
+    }
+
+    function finish(completed, abortReason = null) {
+      if (finished) return;
+      finished = true;
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      onFsChange = null;
+
+      const elapsed = clockNow();
+      const shown = lastDrawn !== null ? lastDrawn + 1 : 0;
+      const shownStream = stream.slice(0, shown);
+
+      let nTargets = 0, nMisses = 0;
+      for (const s of shownStream) {
+        if (!s.is_target) continue;
+        nTargets += 1;
+        if (!s.responded) {
+          nMisses += 1;
+          const ev = presentationRow(s, "Miss");
+          ev.responded = 0; ev.late_response = s.late_rt !== null ? 1 : 0;
+          emit(ev);
+        }
+      }
+
+      let covered = 0, reach = 0;
+      for (const s of shownStream) {
+        if (!s.is_target) continue;
+        const a = Math.max(s.onset, reach), b = Math.min(s.onset + win + lateWin, elapsed);
+        if (b > a) covered += b - a;
+        reach = Math.max(reach, b);
+      }
+
+      const endEv = blankEvent(completed ? "Stream End" : "Stream Aborted");
+      endEv.press_time_s = elapsed.toFixed(4);
+      emit(endEv);
+
+      const thresh = fd + 0.004;
+      const nDropped = frameIntervals.filter(x => x > thresh).length;
+
+      const half = elapsed ? elapsed / 2 : 0;
+      const tH1 = shownStream.filter(s => s.is_target && s.onset < half);
+      const tH2 = shownStream.filter(s => s.is_target && s.onset >= half);
+      const hr = ts => ts.length ? ts.filter(x => x.responded).length / ts.length : "";
+      const rtH1 = tH1.filter(x => x.rt !== null).map(x => x.rt);
+      const rtH2 = tH2.filter(x => x.rt !== null).map(x => x.rt);
+
+      resolve({
+        phase, elapsed, n_presentations: shown,
+        hit_rate_h1: hr(tH1), hit_rate_h2: hr(tH2),
+        mean_rt_h1: rtH1.length ? mean(rtH1) : "", mean_rt_h2: rtH2.length ? mean(rtH2) : "",
+        n_frames: nFrames, n_targets: nTargets, n_hits: nHits, n_misses: nMisses, n_late: nLate,
+        n_fa: nFa, n_dup: nDup, n_other: nOther,
+        hit_rate: nTargets ? nHits / nTargets : "",
+        mean_rt: rts.length ? mean(rts) : "", median_rt: rts.length ? median(rts) : "",
+        mean_late_rt: lateRts.length ? mean(lateRts) : "",
+        time_at_risk: Math.max(0, elapsed - covered),
+        n_dropped: nDropped, completed, abort_reason: abortReason,
+      });
+    }
+
+    requestAnimationFrame(frame);
+  });
+}
+
+// ---- Main ----
+let running = false;
+window.addEventListener("beforeunload", e => { if (running) { e.preventDefault(); e.returnValue = ""; } });
+window.addEventListener("pagehide", () => {
+  if (CAN_SAVE && Saver.pendingEvents.length && navigator.sendBeacon && Backup.runId) {
+    const body = JSON.stringify({ key: KEY, subject: Backup.subject, run_id: Backup.runId, kind: "events", rows: Saver.pendingEvents.splice(0) });
+    navigator.sendBeacon("/api/save", new Blob([body], { type: "application/json" }));
+  }
+});
+
+async function runExperiment(subj, doPractice) {
+  running = true;
+  document.getElementById("setup").style.display = "none";
+  stage.classList.add("on");
+  sizeCanvas();
+  symbolPx = degToPx(P.symbol_height_deg);
+  dotPx = degToPx(P.placeholder_radius_deg);
+  maskPx = degToPx(P.mask_radius_deg);
+
+  paint({ mode: "blank" });
+  msgEl.textContent = "Getting ready…"; msgEl.hidden = false;
+  await sleep(1200);                                  // let the full-screen transition finish
+  const measured = await measureRefresh();
+  msgEl.hidden = true;
+  P.frmrate_measured = measured || P.frmrate_expected;
+  resolveTiming(P);
+  P.keyboard_backend = "browser keydown (event.timeStamp)";
+  console.log("timing at the measured refresh rate", timingSummary(P));
+
+  const seed = subj;
+  const rng = makeRng(seed);
+  const runId = randomHex8();
+  const base = { subject: subj, run_id: runId };
+  Backup.subject = subj; Backup.runId = runId;
+
+  const dpr = window.devicePixelRatio || 1;
+  const params = {
+    run_id: runId, subject: subj, seed,
+    started: localIso(),
+    monitor: {
+      width_cm: +(screen.width / pxPerCm).toFixed(2),
+      distance_cm: distCm,
+      size_pix: [Math.round(screen.width * dpr), Math.round(screen.height * dpr)],
+      size_css_px: [screen.width, screen.height],
+      device_pixel_ratio: dpr,
+      px_per_cm_css: +pxPerCm.toFixed(3),
+      calibration: "credit card (8.56 cm)",
+      symbol_height_px_css: +symbolPx.toFixed(2),
+    },
+    frmrate_measured: P.frmrate_measured,
+    versions: { task: TASK_VERSION, platform: "browser", user_agent: navigator.userAgent },
+    params: JSON.parse(JSON.stringify(P)),
+    timing: timingSummary(P),
+    derived_timing: {
+      soa_mean_s: soaOf(P), soa_min_s: minSoa(P), soa_max_s: maxSoa(P),
+      retention_interval_mean_s: retentionInterval(P),
+      symbols_per_min: 60 / soaOf(P),
+      n_presentations_approx: Math.floor(P.stream_duration / soaOf(P)),
+      min_event_gap_presentations: minGapPresentations(P),
+      no_repeat_window: noRepeatWindow(P),
+    },
+  };
+  Backup.params = params;
+  Saver.send({ ...base, kind: "params", json: params });
+
+  const instr =
+    "Visual Working Memory: Repeat Detection\n\n" +
+    "Letters and numbers will appear one at a time\n" +
+    "in the centre of the screen.\n\n" +
+    "Press the SPACEBAR as soon as a symbol is\n" +
+    `${ruleText(P)}.\n\n` +
+    "Respond as quickly as you can.\n\n" +
+    "Press any key to begin.";
+
+  let instrSecs = 0, expStart = performance.now(), endReason = "completed";
+  try {
+    const t = performance.now();
+    await showText(instr);
+    instrSecs = (performance.now() - t) / 1000;
+    expStart = performance.now();
+
+    const phases = [];
+    if (doPractice)
+      for (let k = 0; k < Math.max(1, P.practice_max_runs); k++)
+        phases.push(["practice", P.practice_duration, makeRng(seed + P.practice_seed_offset + k)]);
+    phases.push(["test", P.stream_duration, rng]);
+
+    let practiceDone = 0;
+    const nPracticeTotal = phases.filter(x => x[0] === "practice").length;
+    for (const [phase, duration, prng] of phases) {
+      if (phase === "practice") {
+        if (practiceDone >= nPracticeTotal) continue;
+        practiceDone += 1;
+      }
+      const label = phase === "practice" ? `practice${practiceDone}` : phase;
+      const stream = buildSequence(prng, duration, P);
+      const problems = validateSequence(stream, P);
+      if (problems.length) console.warn("SEQUENCE WARNINGS", problems);
+
+      const seqRows = stream.map(s => [s.idx, s.onset.toFixed(4), s.symbol, s.is_target ? 1 : 0, s.nback_symbol,
+        s.repeat_lag, f4(s.isi_before), f4(s.isi_after), f4(s.retention)]);
+      Backup.sequences[label] = seqRows;
+      Saver.send({ ...base, kind: "sequence", phase: label, rows: seqRows });
+
+      await showText(phase === "practice"
+        ? `Practice: about ${durationText(P.practice_duration)}.\n\nPress any key to start.`
+        : `Now the main task: ${durationText(P.stream_duration)} without a break.\n\nPress any key to start.`);
+      if (!fsElement()) await sleep(800);           // a key press re-entered full screen; let it settle
+
+      const logEvent = ev => {
+        ev.run_id = runId; ev.subject = subj; ev.practice = phase === "practice" ? 1 : 0; ev.seed = seed;
+        const row = EVENT_FIELDS.map(k => ev[k] ?? "");
+        Backup.events.push(row);
+        Saver.pendingEvents.push(row);
+      };
+
+      const r = await runStream(stream, duration, label, logEvent, base);
+      Saver.flushEvents(base);
+      const blockRow = [
+        localIso(), runId, subj, phase === "practice" ? 1 : 0, seed, label,
+        r.elapsed.toFixed(3), r.n_presentations, r.n_frames, r.n_targets,
+        r.n_hits, r.n_misses, r.n_late, r.n_fa, r.n_dup, r.n_other,
+        fmtOr(r.hit_rate, 4), fmtOr(r.mean_rt, 1), fmtOr(r.median_rt, 1), fmtOr(r.mean_late_rt, 1),
+        fmtOr(r.hit_rate_h1, 4), fmtOr(r.hit_rate_h2, 4), fmtOr(r.mean_rt_h1, 1), fmtOr(r.mean_rt_h2, 1),
+        r.elapsed > 0 ? (r.n_fa / (r.elapsed / 60)).toFixed(2) : "",
+        r.time_at_risk.toFixed(3), P.frmrate_measured.toFixed(3), r.n_dropped, r.completed ? 1 : 0,
+      ];
+      Backup.blocks.push(blockRow);
+      Saver.send({ ...base, kind: "blocks", rows: [blockRow] });
+
+      if (!r.completed) throw new AbortExperiment(r.abort_reason);
+
+      if (phase === "practice") {
+        const hr = r.hit_rate;
+        const nPractice = phases.filter(x => x[0] === "practice").length;
+        const retry = hr !== "" && hr < P.practice_pass_hit_rate && practiceDone < nPractice;
+        const tail = retry
+          ? "It looks like the rule may not be clear yet, so we will run the practice once more.\n\n" +
+            `Remember: press only when a symbol is ${ruleText(P)}.`
+          : "";
+        await showText("Practice complete.\n\n" +
+          `Repeats detected: ${r.n_hits} of ${r.n_targets}\n` +
+          `Missed: ${r.n_misses - r.n_late}\n` +
+          `Pressed too late: ${r.n_late}\n` +
+          `Presses with no repeat: ${r.n_fa}\n\n` +
+          tail + "\n\nPress any key to continue.");
+        if (!retry) practiceDone = nPractice;
+      }
+    }
+  } catch (e) {
+    endReason = e instanceof AbortExperiment ? `aborted (${e.reason})` : `error: ${e && e.message}`;
+    if (!(e instanceof AbortExperiment)) console.error(e);
+  }
+
+  params.instruction_screen_secs = +instrSecs.toFixed(3);
+  params.experiment_secs = +((performance.now() - expStart) / 1000).toFixed(3);
+  params.ended = localIso();
+  params.end_reason = endReason;
+  Saver.send({ ...base, kind: "params", json: params });
+  running = false;
+
+  stage.classList.remove("on");
+  exitFs();
+  const done = document.getElementById("done");
+  done.classList.add("on");
+  const title = document.getElementById("doneTitle"), text = document.getElementById("doneText");
+  if (endReason === "completed") title.textContent = "End of task. Thank you very much.";
+  else if (endReason.includes("left full screen")) title.textContent = "The task stopped because the page left full screen";
+  else title.textContent = "The task was stopped";
+  text.textContent = "Saving your data…";
+
+  const saved = await Saver.drain();
+  if (saved) {
+    text.textContent = "Your data have been sent to the experimenter. You can close this tab.";
+  } else {
+    text.textContent = CAN_SAVE
+      ? "Your data couldn’t be sent to the experimenter (their computer may be offline). Download the files below and email them to the experimenter."
+      : "This link had no access key, so your data weren’t sent. Download the files below and email them to the experimenter.";
+    offerDownloads();
+  }
+}
+
+function csvText(header, rows) {
+  const cell = v => { const s = String(v ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  return [header, ...rows].map(r => r.map(cell).join(",")).join("\r\n") + "\r\n";
+}
+function offerDownloads() {
+  const s = Backup.subject, id = Backup.runId, box = document.getElementById("downloads");
+  const files = [
+    [`VWMcentre_s${s}_${id}_events.csv`, csvText(EVENT_FIELDS, Backup.events), "text/csv"],
+    [`VWMcentre_s${s}_${id}_blocks.csv`, csvText(BLOCK_FIELDS, Backup.blocks), "text/csv"],
+    [`VWMcentre_s${s}_${id}_params.json`, JSON.stringify(Backup.params, null, 2), "application/json"],
+    ...Object.entries(Backup.sequences).map(([ph, rows]) =>
+      [`VWMcentre_s${s}_${id}_${ph}_sequence.csv`, csvText(SEQUENCE_FIELDS, rows), "text/csv"]),
+  ];
+  for (const [name, content, type] of files) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([content], { type }));
+    a.download = name; a.textContent = `Download ${name}`;
+    box.appendChild(a);
+  }
+}
+
+// ---- Setup page ----
+(function setup() {
+  resolveTiming(P);
+  const problems = checkParams(P);
+  const startBtn = document.getElementById("start");
+  if (problems.length) {
+    const el = document.getElementById("paramProblem");
+    el.textContent = "The task parameters are invalid: " + problems.join("; ");
+    el.hidden = false; startBtn.disabled = true;
+  }
+  if (!CAN_SAVE) document.getElementById("keyProblem").hidden = false;
+
+  const q = new URLSearchParams(location.search);
+  if (q.get("subject") && /^\d+$/.test(q.get("subject"))) document.getElementById("subj").value = q.get("subject");
+  document.getElementById("practice").checked = P.run_practice;
+
+  const card = document.getElementById("card"), slider = document.getElementById("cardSlider");
+  const drawCard = () => {
+    const w = +slider.value;
+    card.style.width = w + "px";
+    card.style.height = (w * 53.98 / 85.6) + "px";
+    card.style.borderRadius = (w * 3.18 / 85.6) + "px";
+  };
+  slider.max = Math.max(400, Math.floor(document.getElementById("cardBox").clientWidth || 900));
+  slider.addEventListener("input", drawCard);
+  drawCard();
+
+  startBtn.addEventListener("click", () => {
+    const subj = Number(document.getElementById("subj").value);
+    const dist = Number(document.getElementById("dist").value);
+    if (!Number.isInteger(subj) || subj < 0 || subj > 999999) { alert("Enter a whole-number subject number."); return; }
+    if (!(dist >= 20 && dist <= 200)) { alert("Enter a viewing distance between 20 and 200 cm."); return; }
+    distCm = dist;
+    pxPerCm = +slider.value / 8.56;
+    requestFs();                                     // must happen inside the click
+    runExperiment(subj, document.getElementById("practice").checked);
+  });
+})();
+</script>
+</body>
+</html>
