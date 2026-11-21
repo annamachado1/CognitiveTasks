@@ -20,6 +20,9 @@
   - Leaving full screen during a stream ends the task, like Escape in PsychoPy.
   - Two extra event types: "Focus Lost" / "Focus Regained" (another window or
     tab took focus mid-stream).
+  - The mean ISI, main task length and target rate are set on the start page
+    (as in the PsychoPy dialog). They can be pre-filled from the link, e.g.
+    ?key=...&isi=2&minutes=15&targets=25
 -->
 <style>
   :root {
@@ -74,13 +77,15 @@
   #done { max-width: 36rem; padding: 3rem 1.5rem; display: none; }
   #done.on { display: block; }
   #downloads a { display: block; color: var(--ink); margin: .3rem 0; }
+  #perf { white-space: pre-line; font-size: 1.1rem; margin: 1rem 0 1.5rem; }
+  #perf[hidden] { display: none; }
 </style>
 </head>
 <body>
 
 <main id="setup">
   <h1>Repeat detection task</h1>
-  <p class="lede">Letters and numbers appear one at a time. You press the spacebar when a symbol matches the one two before it. It takes about 17 minutes, runs full screen and needs a physical keyboard.</p>
+  <p class="lede">Letters and numbers appear one at a time. You press the spacebar when a symbol matches the one two before it. It takes about <span id="totalMin">17</span> minutes, runs full screen and needs a physical keyboard.</p>
 
   <p id="keyProblem" class="problem" hidden>This link is missing its access key, so your data can’t be sent to the experimenter. Ask them for the full link. You can still run the task and download your data at the end.</p>
   <p id="paramProblem" class="problem" hidden></p>
@@ -89,6 +94,18 @@
     <input id="subj" type="number" min="0" max="999999" step="1" value="1"></label>
 
   <label class="check"><input id="practice" type="checkbox" checked> Run practice first</label>
+
+  <label class="row"><span>Mean ISI (s)</span>
+    <input id="isiMean" type="number" min="0" step="any"></label>
+  <p class="hint" id="isiHint">Blank gap between symbols.</p>
+
+  <label class="row"><span>Main task length (min)</span>
+    <input id="taskMin" type="number" min="0" step="any"></label>
+  <p class="hint">Length of the main task, not counting practice.</p>
+
+  <label class="row"><span id="rateLabel">Targets (% of symbols)</span>
+    <input id="targetRate" type="number" min="0" step="any"></label>
+  <p class="hint">How often a symbol matches the one two before it.</p>
 
   <label class="row"><span>Viewing distance (cm)</span>
     <input id="dist" type="number" min="20" max="200" step="1" value="57"></label>
@@ -109,6 +126,7 @@
 
 <main id="done">
   <h1 id="doneTitle">Task finished</h1>
+  <p id="perf" hidden></p>
   <p id="doneText"></p>
   <div id="downloads"></div>
 </main>
@@ -137,8 +155,11 @@ const P = {
   late_response_window: 1.0,
 
   target_lag: 2,
-  targets_per_min: 15.0,
-  target_rate_mode: "per_presentation",
+  target_rate_mode: "per_presentation",  // or "per_minute"
+  target_pct: 25.0,             // per_presentation mode: % of symbols that are targets
+  targets_per_min: 15.0,        // per_minute mode: targets per minute
+  // isi_mean, stream_duration and the target rate above are defaults: they
+  // can be changed on the start page for each session.
   min_repeat_gap: 10,
   min_event_gap_s: 2.0,
   first_event_min_s: 6.0,
@@ -172,6 +193,7 @@ const EVENT_FIELDS = [
 ];
 const BLOCK_FIELDS = [
   "datetime", "run_id", "subject", "practice", "seed", "phase",
+  "planned_duration_s", "isi_mean_s", "target_rate", "target_rate_unit",
   "stream_duration_s", "n_presentations", "n_frames",
   "n_targets", "n_hits", "n_misses", "n_late_responses",
   "n_false_alarms", "n_duplicate_presses", "n_other_keys",
@@ -184,7 +206,7 @@ const SEQUENCE_FIELDS = [
   "presentation_num", "onset_s", "symbol", "is_target", "nback_symbol",
   "repeat_lag", "isi_before_s", "isi_after_s", "retention_s",
 ];
-const TASK_VERSION = "web-1.0";
+const TASK_VERSION = "web-1.1";
 const KEY = new URLSearchParams(location.search).get("key") || "";
 const CAN_SAVE = KEY !== "" && location.protocol.startsWith("http");
 
@@ -270,15 +292,33 @@ function checkParams(p) {
   if (p.isi_trunc_sd !== null && p.isi_trunc_sd < 0) problems.push("isi_trunc_sd cannot be negative");
   if (p.isi_min === null || p.isi_max === null) problems.push("set isi_trunc_sd, or set both isi_min and isi_max");
   else if (!(0 < p.isi_min && p.isi_min <= p.isi_mean && p.isi_mean <= p.isi_max))
-    problems.push(`ISI limits ${p.isi_min.toFixed(3)}-${p.isi_max.toFixed(3)}s must satisfy 0 < isi_min <= isi_mean <= isi_max`);
+    problems.push(`ISI limits ${p.isi_min.toFixed(3)}-${p.isi_max.toFixed(3)}s must satisfy 0 < isi_min <= isi_mean <= isi_max (the lower limit is the mean ISI minus ${(p.isi_trunc_sd * p.isi_sd).toFixed(2)}s, so it must stay above zero)`);
   if (p.response_window <= 0) problems.push("response_window must be positive");
   if (p.late_response_window < 0) problems.push("late_response_window cannot be negative");
   if (p.target_lag < 1) problems.push("target_lag must be 1 or more");
   const nSym = new Set(p.symbols).size;
   if (noRepeatWindow(p) >= nSym)
     problems.push(`each symbol must differ from the previous ${noRepeatWindow(p)}, but the pool only has ${nSym} distinct symbols`);
+  if (!(p.stream_duration > 0)) problems.push("the main task length must be positive");
+  if (!(targetRate(p) > 0)) problems.push("the target rate must be positive");
+  else if (!problems.length) {
+    // Targets must be at least minGap symbols apart, which caps how many can fit in the stream.
+    const gap = minGapPresentations(p);
+    if (targetProportion(p) > 1 / gap) {
+      const limit = p.target_rate_mode === "per_presentation"
+        ? `at most ${(100 / gap).toFixed(1)}% of symbols`
+        : `at most ${(60 / soaOf(p) / gap).toFixed(1)} targets per minute`;
+      problems.push(`too many targets: with these timings targets must be at least ${gap} symbols apart, so ${limit} can be targets`);
+    }
+  }
   return problems;
 }
+
+const targetRate = p => p.target_rate_mode === "per_presentation" ? p.target_pct : p.targets_per_min;
+const targetRateUnit = p => p.target_rate_mode === "per_presentation" ? "% of symbols" : "per minute";
+// Expected fraction of symbols that are targets.
+const targetProportion = p => p.target_rate_mode === "per_presentation"
+  ? p.target_pct / 100 : p.targets_per_min * soaOf(p) / 60;
 
 function timingSummary(p) {
   const soa = soaOf(p), lag = p.target_lag, w = p.response_window;
@@ -306,9 +346,26 @@ function ruleText(p) {
   return `the same as the one ${p.target_lag} before it`;
 }
 function durationText(secs) {
-  if (secs < 60) return `${secs} seconds`;
+  const g = x => String(+x.toFixed(2));            // like Python's :g for these values
+  if (secs < 60) return `${g(secs)} seconds`;
   const m = secs / 60;
-  return `${m} minute` + (m === 1 ? "" : "s");
+  return `${g(m)} minute` + (m === 1 ? "" : "s");
+}
+
+// Summary of a block's performance to show the participant.
+function performanceText(r) {
+  const nT = r.n_targets;
+  const pct = nT ? ` (${Math.round(100 * r.n_hits / nT)}%)` : "";
+  const lines = [
+    "Your performance:",
+    "",
+    `Repeats detected: ${r.n_hits} of ${nT}${pct}`,
+    `Missed: ${r.n_misses - r.n_late}`,
+    `Pressed too late: ${r.n_late}`,
+    `Presses with no repeat: ${r.n_fa}`,
+  ];
+  if (r.mean_rt !== "") lines.push(`Average response time: ${(r.mean_rt / 1000).toFixed(2)} s`);
+  return lines.join("\n");
 }
 
 // ---- Sequence construction (ported) ----
@@ -350,12 +407,14 @@ function buildSequence(rng, duration, p) {
   const lastOk = bisectRight(onsets, streamEnd - (p.response_window + p.late_response_window) + 1e-9) - 1;
 
   let nTargets = p.target_rate_mode === "per_presentation"
-    ? Math.round(p.targets_per_min / 60 * nPres)
+    ? Math.round(p.target_pct / 100 * nPres)
     : Math.round(p.targets_per_min * streamEnd / 60);
 
   const span = lastOk + 1 - firstOk;
+  const nRequested = nTargets;
   if (span <= 0) nTargets = 0;
   else if (nTargets > 0 && Math.floor(span / minGap) < nTargets) nTargets = Math.max(0, Math.floor(span / minGap) - 1);
+  if (nTargets < nRequested) console.warn(`only ${nTargets} of the ${nRequested} requested targets fit in this stream`);
 
   const meanGap = nTargets ? span / nTargets : span;
   const extra = Math.max(0, meanGap - minGap);
@@ -814,7 +873,7 @@ async function runExperiment(subj, doPractice) {
     "Respond as quickly as you can.\n\n" +
     "Press any key to begin.";
 
-  let instrSecs = 0, expStart = performance.now(), endReason = "completed";
+  let instrSecs = 0, expStart = performance.now(), endReason = "completed", testResult = null;
   try {
     const t = performance.now();
     await showText(instr);
@@ -860,6 +919,7 @@ async function runExperiment(subj, doPractice) {
       Saver.flushEvents(base);
       const blockRow = [
         localIso(), runId, subj, phase === "practice" ? 1 : 0, seed, label,
+        duration.toFixed(3), P.isi_mean.toFixed(4), String(targetRate(P)), targetRateUnit(P),
         r.elapsed.toFixed(3), r.n_presentations, r.n_frames, r.n_targets,
         r.n_hits, r.n_misses, r.n_late, r.n_fa, r.n_dup, r.n_other,
         fmtOr(r.hit_rate, 4), fmtOr(r.mean_rt, 1), fmtOr(r.median_rt, 1), fmtOr(r.mean_late_rt, 1),
@@ -870,6 +930,7 @@ async function runExperiment(subj, doPractice) {
       Backup.blocks.push(blockRow);
       Saver.send({ ...base, kind: "blocks", rows: [blockRow] });
 
+      if (phase === "test") testResult = r;
       if (!r.completed) throw new AbortExperiment(r.abort_reason);
 
       if (phase === "practice") {
@@ -906,7 +967,14 @@ async function runExperiment(subj, doPractice) {
   const done = document.getElementById("done");
   done.classList.add("on");
   const title = document.getElementById("doneTitle"), text = document.getElementById("doneText");
-  if (endReason === "completed") title.textContent = "End of task. Thank you very much.";
+  if (endReason === "completed") {
+    title.textContent = "End of task. Thank you very much.";
+    if (testResult) {
+      const perf = document.getElementById("perf");
+      perf.textContent = performanceText(testResult);
+      perf.hidden = false;
+    }
+  }
   else if (endReason.includes("left full screen")) title.textContent = "The task stopped because the page left full screen";
   else title.textContent = "The task was stopped";
   text.textContent = "Saving your data…";
@@ -959,6 +1027,25 @@ function offerDownloads() {
   if (q.get("subject") && /^\d+$/.test(q.get("subject"))) document.getElementById("subj").value = q.get("subject");
   document.getElementById("practice").checked = P.run_practice;
 
+  // Mean ISI, main task length and target rate (defaults from P; the link can
+  // pre-fill them with ?isi=..&minutes=..&targets=..).
+  const isiEl = document.getElementById("isiMean");
+  const minEl = document.getElementById("taskMin");
+  const rateEl = document.getElementById("targetRate");
+  if (P.target_rate_mode !== "per_presentation") document.getElementById("rateLabel").textContent = "Targets per minute";
+  document.getElementById("isiHint").textContent = `Blank gap between symbols (SD ${P.isi_sd} s).`;
+  const num = k => (q.get(k) !== null && q.get(k) !== "" && Number.isFinite(Number(q.get(k)))) ? Number(q.get(k)) : null;
+  isiEl.value = num("isi") ?? P.isi_mean;
+  minEl.value = num("minutes") ?? P.stream_duration / 60;
+  rateEl.value = num("targets") ?? targetRate(P);
+  const showTotal = () => {
+    const m = Number(minEl.value);
+    const practiceMin = P.run_practice ? P.practice_max_runs * P.practice_duration / 60 : 0;
+    if (m > 0) document.getElementById("totalMin").textContent = Math.round(m + practiceMin + 0.5);
+  };
+  minEl.addEventListener("input", showTotal);
+  showTotal();
+
   const card = document.getElementById("card"), slider = document.getElementById("cardSlider");
   const drawCard = () => {
     const w = +slider.value;
@@ -975,6 +1062,18 @@ function offerDownloads() {
     const dist = Number(document.getElementById("dist").value);
     if (!Number.isInteger(subj) || subj < 0 || subj > 999999) { alert("Enter a whole-number subject number."); return; }
     if (!(dist >= 20 && dist <= 200)) { alert("Enter a viewing distance between 20 and 200 cm."); return; }
+
+    const vals = [isiEl.value, minEl.value, rateEl.value];
+    if (vals.some(v => v.trim() === "" || !Number.isFinite(Number(v)))) {
+      alert("Mean ISI, main task length and targets must all be numbers."); return;
+    }
+    const cand = { ...P, isi_mean: Number(isiEl.value), stream_duration: Number(minEl.value) * 60 };
+    if (cand.target_rate_mode === "per_presentation") cand.target_pct = Number(rateEl.value);
+    else cand.targets_per_min = Number(rateEl.value);
+    resolveTiming(cand);
+    const bad = checkParams(cand);
+    if (bad.length) { alert("Please check the settings:\n\n" + bad.join("\n")); return; }
+    Object.assign(P, cand);
     distCm = dist;
     pxPerCm = +slider.value / 8.56;
     requestFs();                                     // must happen inside the click

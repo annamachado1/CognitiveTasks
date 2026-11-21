@@ -3,8 +3,10 @@
 # Letters and digits appear one at a time at the centre of the screen, each
 # followed by a blank ISI drawn from a truncated normal distribution.
 # Participants press SPACE when a symbol matches the one two before it.
-# A short practice block (repeated once if performance is low) precedes a
-# 15-minute test block. Data are saved to data/<subject>/.
+# A short practice block (repeated once if performance is low) precedes the
+# test block. The mean ISI, test block length and target rate are set in the
+# start-up dialog (defaults: 2 s, 15 min, 25% of symbols). Data are saved to
+# data/<subject>/.
 
 import traceback
 import sys
@@ -47,8 +49,11 @@ try:
 
         # Sequence
         target_lag=2,                 # n in n-back
-        targets_per_min=15.0,
         target_rate_mode="per_presentation",  # or "per_minute"
+        target_pct=25.0,              # per_presentation mode: % of symbols that are targets
+        targets_per_min=15.0,         # per_minute mode: targets per minute
+        # isi_mean, stream_duration and the target rate above are defaults:
+        # they can be changed in the start-up dialog for each participant.
         min_repeat_gap=10,
         min_event_gap_s=2.0,
         first_event_min_s=6.0,
@@ -117,6 +122,7 @@ try:
 
     BLOCK_FIELDS = [
         "datetime", "run_id", "subject", "practice", "seed", "phase",
+        "planned_duration_s", "isi_mean_s", "target_rate", "target_rate_unit",
         "stream_duration_s", "n_presentations", "n_frames",
         "n_targets", "n_hits", "n_misses", "n_late_responses",
         "n_false_alarms", "n_duplicate_presses", "n_other_keys",
@@ -218,7 +224,44 @@ try:
                 f"each symbol must differ from the previous {no_repeat_window(p)}, "
                 f"but the pool only has {n_sym} distinct symbols — lower "
                 f"min_repeat_gap or add symbols")
+        if p["stream_duration"] <= 0:
+            problems.append("the main task length must be positive")
+        if target_rate(p) <= 0:
+            problems.append("the target rate must be positive")
+        elif not problems:
+            # Targets must be at least min_gap symbols apart, which caps how
+            # many can fit in the stream.
+            gap = min_gap_presentations(p)
+            prop = target_proportion(p)
+            if prop > 1.0 / gap:
+                if p["target_rate_mode"] == "per_presentation":
+                    limit = f"at most {100.0 / gap:.1f}% of symbols"
+                else:
+                    limit = (f"at most {60.0 / soa_of(p) / gap:.1f} targets "
+                             f"per minute")
+                problems.append(
+                    f"too many targets: with these timings targets must be at "
+                    f"least {gap} symbols apart, so {limit} can be targets")
         return problems
+
+
+    def target_rate(p):
+        if p["target_rate_mode"] == "per_presentation":
+            return float(p["target_pct"])
+        return float(p["targets_per_min"])
+
+
+    def target_rate_unit(p):
+        if p["target_rate_mode"] == "per_presentation":
+            return "% of symbols"
+        return "per minute"
+
+
+    def target_proportion(p):
+        """Expected fraction of symbols that are targets."""
+        if p["target_rate_mode"] == "per_presentation":
+            return float(p["target_pct"]) / 100.0
+        return float(p["targets_per_min"]) * soa_of(p) / 60.0
 
 
     def timing_summary(p):
@@ -269,6 +312,11 @@ try:
               f"interval {s['retention_interval_min']:.2f}-"
               f"{s['retention_interval_max']:.2f}s, mean "
               f"{s['retention_interval_mean']:.2f}s")
+        prop = target_proportion(p)
+        print(f"  targets: {100 * prop:.1f}% of symbols, about "
+              f"{prop * 60.0 / s['soa_mean']:.1f} per minute and "
+              f"{int(round(prop * s['n_presentations_approx']))} in the "
+              f"{duration_text(p['stream_duration'])} main task")
         print(f"  no other symbol repeats within {no_repeat_window(p)} symbols")
         print(f"  response window {s['response_window']:.2f}s; targets at "
               f"least {s['min_target_spacing']:.2f}s apart")
@@ -351,15 +399,19 @@ try:
             side="right")) - 1
 
         if p["target_rate_mode"] == "per_presentation":
-            n_targets = int(round(p["targets_per_min"] / 60.0 * n_pres))
+            n_targets = int(round(p["target_pct"] / 100.0 * n_pres))
         else:
             n_targets = int(round(p["targets_per_min"] * stream_end / 60.0))
 
         span = last_ok + 1 - first_ok
+        n_requested = n_targets
         if span <= 0:
             n_targets = 0
         elif n_targets > 0 and span // min_gap < n_targets:
             n_targets = max(0, int(span // min_gap) - 1)
+        if n_targets < n_requested:
+            print(f"[only {n_targets} of the {n_requested} requested targets "
+                  f"fit in this stream]")
 
         mean_gap = span / n_targets if n_targets else span
         extra = max(0.0, mean_gap - min_gap)
@@ -450,18 +502,64 @@ try:
 
 
     # ---- Setup ----
-    def get_subject_info():
+    def show_error_dialog(lines):
+        err = gui.Dlg(title="Please check the settings")
+        for line in lines:
+            err.addText(line)
+        err.show()
+
+
+    def get_subject_info(p):
+        """Show the start-up dialog. The mean ISI, main task length and target
+        rate entered here replace the defaults in P. The dialog is shown again,
+        with the entries kept, until the settings pass the parameter checks."""
+        rate_key = (f"Targets (% of symbols)"
+                    if p["target_rate_mode"] == "per_presentation"
+                    else "Targets per minute")
         info = {
             "Subject Number": 1,
             "Run practice first": True,
-            "Screen width (cm)": 52.0,
-            "Viewing distance (cm)": 57.0,
+            "Mean ISI (s)": float(p["isi_mean"]),
+            "Main task length (min)": float(p["stream_duration"]) / 60.0,
+            rate_key: target_rate(p),
         }
-        dlg = gui.DlgFromDict(info, title="VWM Repeat Detection Task (centre)")
-        if not dlg.OK:
-            core.quit()
-        return (int(info["Subject Number"]), bool(info["Run practice first"]),
-                float(info["Screen width (cm)"]), float(info["Viewing distance (cm)"]))
+        order = ["Subject Number", "Run practice first", "Mean ISI (s)",
+                 "Main task length (min)", rate_key]
+        tips = {
+            "Mean ISI (s)": f"Blank gap between symbols (SD {p['isi_sd']:g}s)",
+            "Main task length (min)": "Length of the test block, not counting practice",
+            rate_key: "How often the current symbol matches the one "
+                      f"{int(p['target_lag'])} back",
+        }
+        defaults = {k: p[k] for k in ("isi_mean", "stream_duration",
+                                      "target_pct", "targets_per_min")}
+        while True:
+            dlg = gui.DlgFromDict(info, title="VWM Repeat Detection Task (centre)",
+                                  order=order, tip=tips)
+            if not dlg.OK:
+                core.quit()
+            try:
+                subj = int(info["Subject Number"])
+                isi_mean = float(info["Mean ISI (s)"])
+                length_min = float(info["Main task length (min)"])
+                rate = float(info[rate_key])
+            except (TypeError, ValueError):
+                show_error_dialog(["Every field except the checkbox must be a number."])
+                continue
+
+            p.update(defaults)
+            p["isi_mean"] = isi_mean
+            p["stream_duration"] = length_min * 60.0
+            if p["target_rate_mode"] == "per_presentation":
+                p["target_pct"] = rate
+            else:
+                p["targets_per_min"] = rate
+            resolve_timing(p)
+            problems = check_params(p)
+            if problems:
+                show_error_dialog(problems)
+                continue
+            return subj, bool(info["Run practice first"])
 
 
     def open_csv(path, header):
@@ -786,6 +884,23 @@ try:
         return summary
 
 
+    def performance_text(result):
+        """Summary of a block's performance to show the participant."""
+        n_t = result["n_targets"]
+        hit_pct = f" ({100.0 * result['n_hits'] / n_t:.0f}%)" if n_t else ""
+        lines = [
+            "Your performance:",
+            "",
+            f"Repeats detected: {result['n_hits']} of {n_t}{hit_pct}",
+            f"Missed: {result['n_misses'] - result['n_late']}",
+            f"Pressed too late: {result['n_late']}",
+            f"Presses with no repeat: {result['n_fa']}",
+        ]
+        if result["mean_rt"] != "":
+            lines.append(f"Average response time: {result['mean_rt'] / 1000.0:.2f} s")
+        return "\n".join(lines)
+
+
     def show_text(win, text, body, wait_key=True, secs=None):
         text.text = body
         for attempt in range(3):
@@ -821,14 +936,16 @@ try:
             print("---------------------------\n")
             sys.exit(1)
 
+        # Mean ISI, main task length and target rate are set in the dialog.
+        subj, do_practice = get_subject_info(P)
         print_timing(P)
-
-        subj, do_practice, screen_w_cm, view_dist_cm = get_subject_info()
         seed = subj
         rng = np.random.default_rng(seed)
         run_id = uuid.uuid4().hex[:8]
 
-        mon = monitors.Monitor("expMonitor", width=screen_w_cm, distance=view_dist_cm)
+        # All sizes are in pixels, so the monitor's physical size and viewing
+        # distance are not needed.
+        mon = monitors.Monitor("expMonitor")
         win = visual.Window(fullscr=True, color=rgb255_to_psychopy(P["bkgd_col"]),
                             units="pix", allowGUI=False, monitor=mon)
         try:
@@ -854,8 +971,7 @@ try:
         win.recordFrameIntervals = True
         win.refreshThreshold = (1.0 / P["frmrate_measured"]) + 0.004
 
-        mon_info = dict(width_cm=screen_w_cm, distance_cm=view_dist_cm,
-                        size_pix=list(win.size))
+        mon_info = dict(size_pix=list(win.size))
         write_sidecar(subj, seed, run_id, mon_info, P["frmrate_measured"])
 
         stim = build_stimuli(win, P)
@@ -887,6 +1003,7 @@ try:
             phases.append(("test", P["stream_duration"], rng))
 
             practice_done = 0
+            test_result = None
             n_practice_total = sum(1 for x in phases if x[0] == "practice")
             for phase, duration, prng in phases:
                 if phase == "practice":
@@ -929,6 +1046,8 @@ try:
                         bk_writer.writerow([
                             datetime.now().isoformat(timespec="milliseconds"),
                             run_id, subj, int(phase == "practice"), seed, label,
+                            f'{duration:.3f}', f'{P["isi_mean"]:.4f}',
+                            f'{target_rate(P):g}', target_rate_unit(P),
                             f'{result["elapsed"]:.3f}', result["n_presentations"],
                             result["n_frames"], result["n_targets"],
                             result["n_hits"], result["n_misses"], result["n_late"],
@@ -957,6 +1076,9 @@ try:
                         ])
                         bk_file.flush()
 
+                if phase == "test" and result:
+                    test_result = result
+
                 if phase == "practice" and result:
                     hr = result["hit_rate"]
                     n_practice = sum(1 for x in phases if x[0] == "practice")
@@ -979,8 +1101,10 @@ try:
                         practice_done = n_practice
 
             show_text(win, text,
-                      "End of Task\n\nThank you very much.\n\n"
-                      "Please get the experimenter.")
+                      "End of Task\n\n"
+                      + (performance_text(test_result) + "\n\n"
+                         if test_result else "")
+                      + "Thank you very much.")
 
         except AbortExperiment:
             print("\n--- ABORTED BY EXPERIMENTER (escape) ---\n")

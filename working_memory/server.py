@@ -38,6 +38,7 @@ EVENT_FIELDS = [
 
 BLOCK_FIELDS = [
     "datetime", "run_id", "subject", "practice", "seed", "phase",
+    "planned_duration_s", "isi_mean_s", "target_rate", "target_rate_unit",
     "stream_duration_s", "n_presentations", "n_frames",
     "n_targets", "n_hits", "n_misses", "n_late_responses",
     "n_false_alarms", "n_duplicate_presses", "n_other_keys",
